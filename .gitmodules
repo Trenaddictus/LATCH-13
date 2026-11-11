@@ -1,3 +1,6 @@
 [submodule "external/TUM-CONTROL"]
 	path = external/TUM-CONTROL
 	url = https://github.com/bzarr/TUM-CONTROL.git
+[submodule "external/f1tenth_racetracks"]
+	path = external/f1tenth_racetracks
+	url = https://github.com/f1tenth/f1tenth_racetracks.git
