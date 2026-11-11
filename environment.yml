@@ -1,0 +1,17 @@
+
+name: latch13
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+  - numpy=1.26
+  - scipy
+  - matplotlib
+  - pandas
+  - pyyaml
+  - pytest
+  - cmake
+  - ninja

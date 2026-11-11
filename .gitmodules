@@ -1,0 +1,3 @@
+[submodule "external/TUM-CONTROL"]
+	path = external/TUM-CONTROL
+	url = https://github.com/bzarr/TUM-CONTROL.git
