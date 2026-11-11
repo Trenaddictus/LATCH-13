@@ -15,15 +15,17 @@ from Vehicle_Simulator.VehicleSimulator import PassengerVehicleSimulator
 -----just replace it with the controller wou wish ;) """
 # from Model_Predictive_Controller.Nominal_NMPC.NMPC_class import Nonlinear_Model_Predictive_Controller as Model_Predictive_Controller
 # from Model_Predictive_Controller.Stochastic_NMPC.SNMPC_class import Stochastic_Nonlinear_Model_Predictive_Controller as Model_Predictive_Controller
-from Model_Predictive_Controller.Reduced_Robustified_NMPC.Reduced_Robustified_NMPC_class import Reduced_Robustified_Nonlinear_Model_Predictive_Controller as Model_Predictive_Controller
+# from Model_Predictive_Controller.Reduced_Robustified_NMPC.Reduced_Robustified_NMPC_class import Reduced_Robustified_Nonlinear_Model_Predictive_Controller as Model_Predictive_Controller
+# SSY226 project: Frenet NMPC (use MPC_params_frenet.yaml below; for the R2NMPC switch back to MPC_params.yaml)
+from Model_Predictive_Controller.Frenet_NMPC.Frenet_NMPC_class import Frenet_Nonlinear_Model_Predictive_Controller as Model_Predictive_Controller
 
 from Utils.SimulationMode_main_class import MPC_Sim
 
 config_path, logs_path  = 'Config/', 'Logs/'
 
 ## --- sim main params ---
-sim_main_params_file    = "EDGAR/sim_main_params.yaml"
-MPC_params_file         = "EDGAR/MPC_params.yaml" 
+sim_main_params_file    = "EDGAR_Frenet/sim_main_params.yaml"
+MPC_params_file         = "EDGAR_Frenet/MPC_params_frenet.yaml"   # R2NMPC: "EDGAR_Frenet/MPC_params.yaml"
 with open(config_path + sim_main_params_file, 'r') as file:
     sim_main_params = yaml.load(file, Loader=yaml.FullLoader)
 

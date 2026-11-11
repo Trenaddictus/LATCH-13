@@ -8,3 +8,7 @@ acados_ocp_SNMPC.json
 acados_ocp_R2NMPC.json
 **monitor.csv
 events.out.**
+# SSY226 project: generated acados code and Windows metadata
+codegen_ocp_*/
+acados_ocp_FNMPC.json
+*:Zone.Identifier

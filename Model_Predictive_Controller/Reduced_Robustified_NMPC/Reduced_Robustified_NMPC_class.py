@@ -364,11 +364,16 @@ class Reduced_Robustified_Nonlinear_Model_Predictive_Controller:
                 # self.acados_solver.constraints_set(stage, "lh", self.acc_min + self.correction_terms_acc)
                 self.acados_solver.constraints_set(stage, "uh", self.acc_max - self.correction_terms_acc)
             time_end_constraint_tightening = time.time()
-            self.stats[0] = self.acados_solver.get_cost()
-            self.stats[1] = self.acados_solver.get_stats('time_tot') + time_end_constraint_tightening - time_begin_constraint_tightening
-            self.stats[2] = self.acados_solver.get_stats('sqp_iter')
-            self.stats[3] = np.max(self.acados_solver.get_stats('qp_iter'))
-            self.stats[4] = status
+            t_constraint_tightening = time_end_constraint_tightening - time_begin_constraint_tightening
+        else:
+            t_constraint_tightening = 0.0
+        # solver stats are logged after every solve (also failed ones), so that failures are visible
+        # in the logs and main.py can react to status != 0 (originally only updated if status == 0)
+        self.stats[0] = self.acados_solver.get_cost()
+        self.stats[1] = self.acados_solver.get_stats('time_tot') + t_constraint_tightening
+        self.stats[2] = self.acados_solver.get_stats('sqp_iter')
+        self.stats[3] = np.max(self.acados_solver.get_stats('qp_iter'))
+        self.stats[4] = status
 
         ## --- Weights-varying MPC ---
         if self.WMPC:
