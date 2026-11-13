@@ -1,0 +1,23 @@
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latch13"
+version = "0.1.0"
+description = "Learning-based terminal costs for short-horizon model predictive control"
+requires-python = ">=3.11,<3.12"
+
+# The Conda environment currently manages our dependencies.
+# These will be documented and pinned during setup automation.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["latch13*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+pythonpath = ["src"]

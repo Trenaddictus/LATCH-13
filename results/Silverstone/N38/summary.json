@@ -1,0 +1,22 @@
+{
+  "track": "Silverstone",
+  "horizon_N": 38,
+  "mpc_dt_s": 0.08,
+  "sim_dt_s": 0.02,
+  "reference_speed_mps": 5.0,
+  "track_scale": 10.0,
+  "track_length_m": 4462.014503219709,
+  "simulation_type": "TUM-CONTROL PassengerVehicleSimulator",
+  "plotter": "TUM-CONTROL Mode 1",
+  "samples": 7,
+  "simulated_time_s": 0.56,
+  "completed_laps": 0,
+  "stop_reason": "solver_status_4",
+  "lateral_rmse_m": 0.014653788140753682,
+  "max_abs_lateral_error_m": 0.03407575417532274,
+  "mean_solver_ms": 13.253857142857143,
+  "p95_solver_ms": 36.691799999999986,
+  "max_solver_ms": 40.812,
+  "solver_failures": 1,
+  "wall_elapsed_s": 0.6881528999947477
+}
