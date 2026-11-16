@@ -72,7 +72,12 @@ def build_ocp(settings, N):
     opts.nlp_solver_type = "SQP"       # Converged solution for implicit differentiation.
     # Same cost Hessian approximation as the original. Leap-C makes an exact-Hessian
     # backward solver for the KKT sensitivities, including dynamics and constraints.
-    opts.hessian_approx = "GAUSS_NEWTON"
+    # opts.hessian_approx = "GAUSS_NEWTON"
+    # GN ignores the dynamics curvature; with the weak (x0.005) cost this stalled SQP
+    # far from the solution (full lap: step 662 for N=38, 1047 for N=10). The exact
+    # Hessian solved those states in 2-5 iterations and N=38 completed a full lap.
+    opts.hessian_approx = "EXACT"
+    opts.regularize_method = "MIRROR"
     opts.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     opts.qp_solver_ric_alg = 0
     opts.qp_solver_cond_N = N
@@ -91,7 +96,10 @@ def build_ocp(settings, N):
     for key in ["eq", "ineq", "comp"]:
         setattr(opts, "nlp_solver_tol_" + key, settings["nlp_tolerance"])
     # Stationarity tolerance loosened from nlp_tolerance (1e-7) as a safety net.
-    opts.nlp_solver_tol_stat = 1e-6
+    # opts.nlp_solver_tol_stat = 1e-6
+    # With the exact Hessian, stationarity reaches a floor of ~1e-5 at some states
+    # (full lap, N=38 step 837), so 1e-6 was unreachable there.
+    opts.nlp_solver_tol_stat = 1e-5
     return ocp, manager, P0
 
 
