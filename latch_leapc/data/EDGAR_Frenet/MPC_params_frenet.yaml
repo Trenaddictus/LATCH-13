@@ -1,0 +1,34 @@
+# Parameters for the Frenet NMPC (Model_Predictive_Controller/Frenet_NMPC).
+# Horizon (Tp, Ts_MPC) and the reference trajectory are taken from sim_main_params.yaml.
+solver_build: True
+solver_generate_C_code: True
+enable_WMPC: False            # not supported by the Frenet NMPC; kept for compatibility with the Logger
+
+# --- stage cost l = 0.5 * 0.01 * (q_ey e_y^2 + q_epsi e_psi^2 + q_v (v_x - v_ref)^2 + r_jerk jerk^2 + r_steering_rate delta_dot^2)
+# (acados additionally scales stage costs by the shooting interval Ts_MPC; the terminal cost is not scaled)
+# Starting values = TUM's Cartesian weights (q_lat, q_yaw, q_vel, r_jerk, r_steering_rate).
+q_ey            : 2.8
+q_epsi          : 0.4
+q_v             : 2.0         # tuned 2026-11-11 (TUM value 0.2 too weak without a longitudinal position term)
+r_jerk          : 38.1
+r_steering_rate : 101.4
+
+# --- terminal cost V_f = 0.5 * 0.01 * xi^T diag(P) xi,  xi = [e_y, e_psi, v_x - v_ref(s_N)]
+# Benchmark: quadratic, P = stage weights (same choice as TUM's Qe = Q).
+P_ey            : 2.8
+P_epsi          : 0.4
+P_v             : 2.0
+
+# --- constraints
+lookuptable_gg_limits: 'EDGAR_Frenet/ggv.csv'   # combined (circular) acceleration limit, as TUM combined_acc_limits: 2
+track_margin    : 0.0         # extra safety distance [m] beyond half the vehicle width
+L1_pen          : 106.7       # slack penalties (linear / quadratic) for acceleration, delta and a bounds (TUM values)
+L2_pen          : 9.9
+L1_pen_track    : 1000.0      # slack penalties for the track-bound constraint
+L2_pen_track    : 1000.0
+
+# --- solver
+qp_solver           : 'PARTIAL_CONDENSING_HPIPM'
+qp_solver_iter_max  : 50
+nlp_solver_type     : 'SQP_RTI'
+sim_method_num_steps: 3       # RK4 steps per shooting interval

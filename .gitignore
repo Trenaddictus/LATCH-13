@@ -201,3 +201,5 @@ __marimo__/
 
 # Trash
 **/trash
+*.bak
+latch_leapc_results_backup_*/

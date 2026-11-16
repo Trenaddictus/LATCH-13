@@ -1,10 +1,12 @@
 """Utilities for creating an AcadosOcpBatchSolver from an AcadosOcp object."""
 
 from copy import deepcopy
+import os
 from pathlib import Path
 from tempfile import mkdtemp
 
 from acados_template import AcadosOcp, AcadosOcpBatchSolver, AcadosOcpSolver
+from acados_template.builders import ocp_get_default_cmake_builder
 
 from leap_c.diff_mpc.utils.delete_directory_hook import DeleteDirectoryHook
 
@@ -39,8 +41,29 @@ def create_batch_solver(
         add_delete_hook = False
         try_code_reuse = True
 
+    export_directory = export_directory.resolve()
+    export_directory.mkdir(parents=True, exist_ok=True)
     ocp.code_gen_opts.code_export_directory = str(export_directory / "c_generated_code")
     json_file = str(export_directory / "acados_ocp.json")
+
+    cmake_builder = None
+    if os.name == "nt":
+        # A previous failed compile can leave a matching JSON but no solver DLL.
+        # Such a directory is not a reusable binary cache.
+        generated_dll = (
+            export_directory / "c_generated_code"
+            / f"acados_ocp_solver_{ocp.model.name}.dll"
+        )
+        if not generated_dll.is_file():
+            try_code_reuse = False
+        cmake_builder = ocp_get_default_cmake_builder()
+        cmake_builder.generator = "Visual Studio 17 2022"
+        cmake_builder.host = "x64"
+        cmake_builder.build_dir = str(export_directory / "c_generated_code" / "build")
+        # The matched CMake template adds the compiler's OpenMP runtime/flags.
+        cmake_builder.additional_cmake_options = (
+            "-DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=ON"
+        )
 
     if try_code_reuse:
         batch_solver = AcadosOcpBatchSolver(
@@ -51,6 +74,7 @@ def create_batch_solver(
             build=False,
             generate=False,
             check_code_reuse_possible=True,
+            cmake_builder=cmake_builder,
             verbose=verbose,
         )
     else:
@@ -62,6 +86,7 @@ def create_batch_solver(
             build=True,
             generate=True,
             check_code_reuse_possible=False,
+            cmake_builder=cmake_builder,
             verbose=verbose,
         )
 

@@ -1,0 +1,21 @@
+# Same physical model, stage weights, constraints and Silverstone reference as LATCH-13.
+prediction_dt: 0.08
+simulation_dt: 0.02
+rk_steps: 3
+short_horizon: 10      # 0.80 seconds (starting experiment, not an established optimum)
+long_horizon: 38       # 3.04 seconds, original LATCH horizon
+nlp_max_iter: 100
+nlp_tolerance: 1.0e-7
+initial_reference_index: 0
+# New runner integrates jerk over simulation_dt, rather than using prediction node 1.
+# Set latch_legacy only for a separate reproduction of the old actuation convention.
+actuation: consistent_jerk
+seed: 226
+training:
+  samples: 128
+  batch_size: 8
+  epochs: 30
+  learning_rate: 0.08
+  early_stopping_patience: 5
+  multiplier_min: 0.05
+  multiplier_max: 100.0
