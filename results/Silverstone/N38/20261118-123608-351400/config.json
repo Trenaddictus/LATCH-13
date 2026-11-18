@@ -1,0 +1,14 @@
+{
+  "track": "Silverstone",
+  "N": 38,
+  "dt": 0.08,
+  "speed": 5.0,
+  "scale": 10.0,
+  "steps": 100,
+  "plot_every": 5,
+  "no_plot": false,
+  "max_error": 8.0,
+  "terminal_cost": "quadratic",
+  "output": null,
+  "replay": null
+}

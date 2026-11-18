@@ -1,0 +1,21 @@
+{
+  "track": "Silverstone",
+  "horizon_N": 38,
+  "mpc_dt_s": 0.08,
+  "sim_dt_s": 0.02,
+  "reference_speed_mps": 5.0,
+  "terminal_cost": "quadratic",
+  "track_scale": 10.0,
+  "track_length_m": 4462.014503219709,
+  "samples": 6,
+  "simulated_time_s": 0.48,
+  "completed_laps": 0,
+  "stop_reason": "solver_status_4",
+  "solver_failures": 1,
+  "lateral_rmse_m": 0.007303756541633947,
+  "max_abs_lateral_error_m": 0.016407958993209487,
+  "mean_solver_ms": 8.800333333333334,
+  "p95_solver_ms": 12.58075,
+  "max_solver_ms": 13.185,
+  "wall_elapsed_s": 0.1321161269734148
+}

@@ -1,21 +1,16 @@
-"""LATCH-13: Frenet MPC with the independent TUM vehicle simulator.
+"""Run acados Frenet MPC, save results, then inspect them offline.
 
-State conventions
------------------
-MPC (Frenet, 7): [s, e_y, e_psi, v_x, v_y, r, delta]
-Plant (Cartesian, 7): [X, Y, psi, v_x, v_y, r, delta]
-Controls (2): [longitudinal_acceleration, steering_rate]
-
-Visualization uses the original TUM-CONTROL Mode 1 plotting functions,
-without instantiating TUM's tightly-coupled Logger class.
-
-Run from the LATCH-13 repository root, after activating the Conda environment
-and configuring ACADOS_SOURCE_DIR, LD_LIBRARY_PATH and PYTHONPATH.
+MPC state: [s, ey, epsi, vx, vy, r, delta, a]. Inputs: [jerk, steering_rate].
+The independent TUM plant uses seven Cartesian states and [a, steering_rate].
+No plotting occurs during optimization or plant integration.
+Use --replay RUN_DIRECTORY to inspect a saved run without rebuilding acados.
 """
 
 import argparse
 import csv
 import json
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -23,12 +18,44 @@ import numpy as np
 import yaml
 from scipy.ndimage import gaussian_filter1d
 
-from latch13.controllers.ocp import build_mpc
-from Vehicle_Simulator.VehicleSimulator import PassengerVehicleSimulator
 
 ROOT = Path(__file__).resolve().parents[1]
 TUM_CONFIG = ROOT / "external" / "TUM-CONTROL" / "Config" / "EDGAR"
 TRACK_ROOT = ROOT / "external" / "f1tenth_racetracks"
+
+
+def configure_acados_environment():
+    """Discover installed acados and restart once if its loader path is missing.
+
+    Linux reads LD_LIBRARY_PATH at process startup, so changing os.environ
+    alone does not fix ctypes loading transitive acados dependencies. Explicit
+    ACADOS_SOURCE_DIR takes precedence over discovery from acados_template.
+    Replay never calls this function.
+    """
+    from importlib.util import find_spec
+
+    configured = os.environ.get("ACADOS_SOURCE_DIR")
+    if configured:
+        source = Path(configured).expanduser().resolve()
+    else:
+        spec = find_spec("acados_template")
+        if spec is None or spec.origin is None:
+            raise RuntimeError("Install acados_template in the active Python environment")
+        source = next((parent for parent in Path(spec.origin).resolve().parents
+                       if (parent / "lib" / "libacados.so").is_file()), None)
+        if source is None:
+            raise RuntimeError("Cannot discover acados; set ACADOS_SOURCE_DIR to its installation directory")
+    library_dir = source / "lib"
+    if not (library_dir / "libacados.so").is_file():
+        raise FileNotFoundError(f"Missing acados shared library: {library_dir / 'libacados.so'}")
+
+    os.environ["ACADOS_SOURCE_DIR"] = str(source)
+    paths = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+    if str(library_dir) not in paths:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [str(library_dir)] + [path for path in paths if path]
+        )
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def numeric_csv(path, min_cols):
@@ -151,6 +178,8 @@ def load_centerline_boundaries(name, scale):
 
 
 def create_simulator(mpc_dt):
+    from Vehicle_Simulator.VehicleSimulator import PassengerVehicleSimulator
+
     with open(TUM_CONFIG / "sim_main_params.yaml", encoding="utf-8") as f:
         sim_config = yaml.safe_load(f)
     sim_dt = float(sim_config["Ts"])
@@ -168,341 +197,281 @@ def create_simulator(mpc_dt):
     return vehicle, sim_dt, substeps
 
 
-class TUMLiveMode1:
-    """Invoke TUM's original Mode 1 plot functions with LATCH-13 data."""
+def advance_plant(simulator, cartesian_state, acceleration, control, sim_dt, substeps):
+    """Apply constant jerk using a midpoint acceleration at each plant substep.
 
-    def __init__(self, track, track_name, scale, initial_state,
-                 simulator, N, dt, speed):
-        # TUM exposes these functions in Logging_Plotting's module scope.
-        from Utils.Logging_Plotting import initLiveVisuMode1, updateLiveVisuMode1
-        import matplotlib.pyplot as plt
+    Acceleration is an ideal commanded actuator state: a_dot = jerk. TUM's
+    seven-state plant has no acceleration actuator state of its own. Midpoint
+    sampling approximates the ramp inside each substep; no clipping changes the
+    optimized input. Return the endpoint acceleration for the next MPC state.
+    """
+    jerk, steering_rate = np.asarray(control, dtype=float).reshape(2)
+    state = np.asarray(cartesian_state, dtype=float).copy()
+    for _ in range(substeps):
+        midpoint_acceleration = acceleration + 0.5 * sim_dt * jerk
+        state = np.asarray(simulator.simulator_step(
+            state, np.array([midpoint_acceleration, steering_rate])
+        ), dtype=float).reshape(-1)
+        acceleration += sim_dt * jerk
+        if state.shape != (7,) or not np.all(np.isfinite(state)):
+            raise ValueError("Invalid Cartesian plant state")
+    return state, float(acceleration)
 
-        self.plt = plt
-        self.tum_update = updateLiveVisuMode1
-        self.track, self.N, self.dt, self.speed = track, N, dt, speed
-        self.t0 = time.perf_counter()
-        self.length = float(simulator.params.veh_length)
-        self.width = float(simulator.params.veh_width)
-        self.xwidth = 100.0
-        self.ywidth = 100.0
-        self.capacity = 2048
-        self.CiLX = np.zeros((self.capacity, 7))
-        self.DisturbedX = np.zeros((self.capacity, 7))
-        self.simU = np.zeros((self.capacity, 2))
-        self.CiLX[0] = initial_state
-        self.DisturbedX[0] = initial_state
 
-        center, left, right = load_centerline_boundaries(track_name, scale)
-        pose = np.array([
-            initial_state[0], initial_state[1], initial_state[2],
-            np.hypot(initial_state[3], initial_state[4]),
-        ])
-        self.fig, self.ax = plt.subplots(figsize=(10, 10))
-        (
-            self.MPC_pred_line,
-            self.Ref_traj_line,
-            self.Disturbed_traj_line,
-            self.ax,
-            self.center_line,
-            self.inner_line,
-            self.outer_line,
-            self.line,
-            self.dot,
-            self.text,
-        ) = initLiveVisuMode1(
-            self.ax, self.CiLX, pose,
-            self.xwidth, self.ywidth,
-            center[:, 0], left[:, 0], right[:, 0],
-            center[:, 1], left[:, 1], right[:, 1],
-            self.length, self.width,
-        )
-        self.fig.suptitle("LATCH-13 | TUM-CONTROL Mode 1 | Frenet MPC")
-        plt.show(block=False)
+def initialize_solver(solver, xf, N, dt, speed):
+    for j in range(N + 1):
+        guess = xf.copy()
+        guess[0] += j * dt * speed
+        solver.set(j, "x", guess)
+        if j < N:
+            solver.set(j, "u", np.zeros(2))
 
-    def store(self, step, cartesian_state, control):
-        """Record EVERY step, even if we only redraw occasionally."""
-        required = step + 2
-        if required > self.capacity:
-            new_capacity = max(required, self.capacity * 2)
-            for name in ("CiLX", "DisturbedX", "simU"):
-                old = getattr(self, name)
-                new = np.zeros((new_capacity, old.shape[1]))
-                new[:len(old)] = old
-                setattr(self, name, new)
-            self.capacity = new_capacity
-        self.CiLX[step + 1] = cartesian_state
-        self.DisturbedX[step + 1] = cartesian_state
-        self.simU[step] = control
 
-    def redraw(self, step, solver, progress):
-        prediction = np.zeros((self.N + 1, 8))
-        reference = np.zeros((self.N + 1, 4))
-        for j in range(self.N + 1):
-            state = np.asarray(solver.get(j, "x"), dtype=float).reshape(-1)
-            s, ey, epsi, vx, vy, yaw_rate, steering = state
-            Xref, Yref, psi_ref = reference_pose(self.track, s)
-            prediction[j, :7] = [
-                Xref - ey * np.sin(psi_ref),
-                Yref + ey * np.cos(psi_ref),
-                psi_ref + epsi, vx, vy, yaw_rate, steering,
-            ]
-            if j < self.N:
-                prediction[j, 7] = float(np.asarray(
-                    solver.get(j, "u"), dtype=float
-                ).reshape(-1)[0])
-            elif self.N > 0:
-                prediction[j, 7] = prediction[j - 1, 7]
-            xr, yr, yaw_ref = reference_pose(
-                self.track, progress + j * self.dt * self.speed
-            )
-            reference[j] = [xr, yr, yaw_ref, self.speed]
+def shift_warm_start(solver, N):
+    """Move the last optimized trajectory forward by one controller interval."""
+    states = [solver.get(j, "x") for j in range(1, N + 1)]
+    controls = [solver.get(j, "u") for j in range(1, N)]
+    controls.append(solver.get(N - 1, "u"))
+    for j in range(N):
+        solver.set(j, "x", states[j])
+        solver.set(j, "u", controls[j])
+    solver.set(N, "x", states[-1])
 
-        ref_index = int(np.searchsorted(
-            self.track["s"], progress % self.track["L"], side="right"
-        ) - 1)
-        self.tum_update(
-            step + 1,
-            time.perf_counter() - self.t0,
-            self.CiLX,
-            self.simU,
-            self.DisturbedX,
-            {
-                "pos_x": reference[:, 0],
-                "pos_y": reference[:, 1],
-                "ref_yaw": reference[:, 2],
-                "ref_v": reference[:, 3],
-            },
-            prediction,
-            self.Ref_traj_line,
-            self.MPC_pred_line,
-            self.Disturbed_traj_line,
-            self.ax,
-            self.xwidth,
-            self.ywidth,
-            self.line,
-            self.dot,
-            self.text,
-            self.length,
-            self.width,
-            current_ref_idx=ref_index,
-        )
-        self.plt.pause(0.001)
-        return self.plt.fignum_exists(self.fig.number)
 
-    def save_and_close(self, path):
-        if self.plt.fignum_exists(self.fig.number):
-            self.fig.savefig(path, dpi=150)
-            self.plt.close(self.fig)
+def prediction_snapshot(solver, N, parameters):
+    """Rows contain eight states, two controls, and curvature; terminal u is NaN."""
+    snapshot = np.full((N + 1, 11), np.nan)
+    for j in range(N + 1):
+        snapshot[j, :8] = np.asarray(solver.get(j, "x")).reshape(8)
+        snapshot[j, 10] = parameters[j]
+        if j < N:
+            snapshot[j, 8:10] = np.asarray(solver.get(j, "u")).reshape(2)
+    return snapshot
+
+
+def solver_diagnostics(solver):
+    """Best-effort diagnostics must not hide the original failure."""
+    result = {}
+    for name in ("time_tot", "nlp_iter", "residuals"):
+        try:
+            value = solver.get_residuals() if name == "residuals" else solver.get_stats(name)
+            result[name] = np.asarray(value).tolist()
+        except Exception as error:
+            result[name] = {"unavailable": str(error)}
+    return result
+
+
+def solve_with_recovery(solver, xf, parameters, N, dt, speed):
+    """Solve once, then try one cold restart at the SAME measured state.
+
+    Record rejected iterates before reset. No failed solution is applied to the
+    plant. This follows TUM's reinitialization approach, but requires a successful
+    retry rather than continuing with the failed solve's first control.
+    """
+    attempts = []
+    total_solver_ms = 0.0
+    for attempt in range(2):
+        if attempt:
+            solver.reset()
+            initialize_solver(solver, xf, N, dt, speed)
+        solver.constraints_set(0, "lbx", xf)
+        solver.constraints_set(0, "ubx", xf)
+        for j, kappa in enumerate(parameters):
+            solver.set(j, "p", np.array([kappa]))
+        status = int(solver.solve())
+        details = solver_diagnostics(solver)
+        total_solver_ms += float(np.asarray(details["time_tot"]).reshape(-1)[0]) * 1000
+        details["status"] = status
+        if status != 0:
+            details["rejected_prediction"] = prediction_snapshot(solver, N, parameters).tolist()
+        attempts.append(details)
+        if status == 0:
+            break
+    return status, attempts, total_solver_ms
 
 
 def run(args):
-    track = load_track(args.track, args.scale)
-    output = ROOT / "results" / args.track / f"N{args.N}"
-    output.mkdir(parents=True, exist_ok=True)
+    from dataclasses import asdict
+    from datetime import datetime
 
-    first_segment = track["segments"][0]
-    yaw0 = float(np.arctan2(first_segment[1], first_segment[0]))
-    # Physical plant: [X, Y, psi, vx, vy, r, delta]
-    xc = np.array([
-        track["x"][0], track["y"][0], yaw0, args.speed, 0, 0, 0
-    ], dtype=float)
-    # Frenet MPC: [s, ey, epsi, vx, vy, r, delta]
-    xf = np.array([0, 0, 0, args.speed, 0, 0, 0], dtype=float)
+    # TUM-CONTROL uses top-level imports such as Prediction_Models and
+    # Vehicle_Simulator. Resolve its root relative to this script so running
+    # the baseline does not depend on a shell-specific PYTHONPATH setting.
+    tum_root = ROOT / "external" / "TUM-CONTROL"
+    if not (tum_root / "Prediction_Models").is_dir():
+        raise FileNotFoundError(f"Missing TUM-CONTROL prediction models: {tum_root}")
+    if str(tum_root) not in sys.path:
+        sys.path.insert(0, str(tum_root))
 
-    solver = build_mpc(
-        TUM_CONFIG, xf, N=args.N, dt=args.dt,
-        v_ref=args.speed, output_dir=output / "solver",
+    from latch13.controllers.ocp import (
+        ConstraintOptions, SolverOptions, StageCostWeights, build_mpc, zero_terminal_cost,
     )
-    for j in range(args.N + 1):
-        guess = xf.copy()
-        guess[0] += j * args.dt * args.speed
-        solver.set(j, "x", guess)
-        if j < args.N:
-            solver.set(j, "u", np.zeros(2))
 
+    track = load_track(args.track, args.scale)
+    output = Path(args.output).resolve() if args.output else (
+        ROOT / "results" / args.track / f"N{args.N}" /
+        datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    # Save geometry so replay needs neither track CSVs nor the solver.
+    center, left, right = load_centerline_boundaries(args.track, args.scale)
+    np.savez(output / "track.npz", **track, center=center, left=left, right=right)
+    (output / "config.json").write_text(json.dumps({
+        **vars(args), "solver_options": asdict(SolverOptions()),
+        "stage_weights": asdict(StageCostWeights()),
+        "constraint_options": asdict(ConstraintOptions()),
+    }, indent=2), encoding="utf-8")
+
+    yaw0 = float(np.arctan2(*track["segments"][0][::-1]))
+    xc = np.array([track["x"][0], track["y"][0], yaw0, args.speed, 0, 0, 0.])
+    xf = np.array([0, 0, 0, args.speed, 0, 0, 0, 0.])
+    terminal = zero_terminal_cost if args.terminal_cost == "zero" else None
+    solver = build_mpc(
+        TUM_CONFIG, xf, N=args.N, dt=args.dt, v_ref=args.speed,
+        output_dir=output / "solver", terminal_cost=terminal,
+    )
+    initialize_solver(solver, xf, args.N, args.dt, args.speed)
     simulator, sim_dt, substeps = create_simulator(args.dt)
-    print("Plant: TUM-CONTROL PassengerVehicleSimulator (7-state Cartesian)")
-    print("Controller: LATCH-13 Frenet MPC (7-state, acceleration input)")
-    print(f"Track: {args.track}, length: {track['L']:.1f} m")
-    print(f"MPC dt: {args.dt}, plant dt: {sim_dt}, substeps: {substeps}")
+    print(f"Eight-state Frenet MPC: N={args.N}, horizon={args.N * args.dt:.2f}s")
+    print(f"Plant dt={sim_dt}s, MPC dt={args.dt}s; plotting after simulation")
+    print(f"Results: {output}")
 
-    viewer = None
-    if not args.no_plot:
-        viewer = TUMLiveMode1(
-            track, args.track, args.scale, xc, simulator,
-            args.N, args.dt, args.speed,
-        )
-
-    keys = [
-        "step", "time_s", "lap", "s_m", "X_m", "Y_m", "yaw_rad",
-        "ey_m", "epsi_rad", "vx_mps", "vy_mps", "yaw_rate_radps",
-        "steering_angle_rad", "acceleration_mps2", "steering_rate_radps",
-        "solver_time_ms", "controller_wall_ms", "solver_status",
+    fields = [
+        "step", "time_s", "lap", "s_m", "X_m", "Y_m", "yaw_rad", "ey_m", "epsi_rad",
+        "vx_mps", "vy_mps", "yaw_rate_radps", "steering_angle_rad", "acceleration_mps2",
+        "jerk_mps3", "steering_rate_radps", "solver_time_ms", "controller_wall_ms", "solver_status",
     ]
-    samples = 0
-    progress = 0.0
-    previous_wrapped_s = 0.0
-    ey_sq_sum = 0.0
-    max_ey = 0.0
+    samples, progress, previous_s, failures = 0, 0.0, 0.0, 0
+    recovered_solves = 0
+    ey_sq_sum, max_ey = 0.0, 0.0
     solve_times = []
-    failures = 0
     stop_reason = "step_limit"
     t0 = time.perf_counter()
-    csv_path = output / "trajectory.csv"
-
     try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=keys)
+        with open(output / "trajectory.csv", "w", newline="", encoding="utf-8") as handle, \
+             open(output / "predictions.npy", "wb") as predictions, \
+             open(output / "diagnostics.jsonl", "w", encoding="utf-8") as diagnostics:
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
-            iteration = 0
-            while args.steps == 0 or iteration < args.steps:
+            writer.writerow(dict(zip(fields, [
+                -1, 0, 0, 0, *xc[:3], 0, 0, *xc[3:], 0,
+                0, 0, 0, 0, -1,
+            ])))
+            while args.steps == 0 or samples < args.steps:
                 loop_start = time.perf_counter()
-                solver.constraints_set(0, "lbx", xf)
-                solver.constraints_set(0, "ubx", xf)
-
-                # Initial approximation: track curvature at expected progress.
-                for j in range(args.N + 1):
-                    expected_s = xf[0] + j * args.dt * args.speed
-                    solver.set(j, "p", np.array([curvature(track, expected_s)]))
-
-                status = int(solver.solve())
-                wall_ms = (time.perf_counter() - loop_start) * 1000.0
+                parameters = [curvature(track, xf[0] + j * args.dt * args.speed)
+                              for j in range(args.N + 1)]
+                status, attempts, solve_ms = solve_with_recovery(
+                    solver, xf, parameters, args.N, args.dt, args.speed,
+                )
+                if status == 0 and len(attempts) > 1:
+                    recovered_solves += 1
+                    print(f"Recovered solver at step {samples} after cold restart")
+                wall_ms = (time.perf_counter() - loop_start) * 1000
+                info = {"step": samples, "time_s": samples * args.dt,
+                        "status": status, "frenet_state": xf.tolist(),
+                        "attempts": attempts, "total_solver_ms": solve_ms,
+                        **solver_diagnostics(solver)}
+                if status != 0 or samples % args.plot_every == 0 or samples + 1 == args.steps:
+                    np.save(predictions, prediction_snapshot(solver, args.N, parameters), allow_pickle=False)
+                    info["prediction_saved"] = True
+                diagnostics.write(json.dumps(info) + "\n")
+                diagnostics.flush()
                 if status != 0:
                     failures += 1
                     stop_reason = f"solver_status_{status}"
-                    print(f"Solver failed at step {iteration}: status {status}")
-                    try:
-                        print("Residuals:", solver.get_residuals())
-                        print("NLP iterations:", solver.get_stats("nlp_iter"))
-                    except Exception:
-                        pass
+                    print(f"Solver failed at step {samples}: status {status}")
                     break
 
-                u0 = np.asarray(solver.get(0, "u"), dtype=float).reshape(-1)
-                if u0.size != 2:
-                    raise ValueError("Expected [acceleration, steering_rate]")
-                solve_ms = float(np.asarray(
-                    solver.get_stats("time_tot")
-                ).reshape(-1)[0]) * 1000.0
-
-                # Original TUM simulator: same input ordering [a_x, delta_dot].
-                sim_input = u0.copy()
-                for _ in range(substeps):
-                    xc = np.asarray(
-                        simulator.simulator_step(xc, sim_input), dtype=float
-                    ).reshape(-1)
-                if xc.size != 7 or not np.all(np.isfinite(xc)):
-                    stop_reason = "invalid_plant_state"
-                    print("Invalid vehicle state; stopping")
-                    break
-
-                wrapped_s, ey, epsi = project(track, xc[0], xc[1], xc[2])
+                u0 = np.asarray(solver.get(0, "u"), dtype=float).reshape(2)
+                if not np.all(np.isfinite(u0)):
+                    raise ValueError("Nonfinite optimized control")
+                xc, acceleration = advance_plant(simulator, xc, xf[7], u0, sim_dt, substeps)
+                wrapped_s, ey, epsi = project(track, *xc[:3])
                 L = track["L"]
-                ds = ((wrapped_s - previous_wrapped_s + L / 2) % L) - L / 2
-                progress += ds
-                previous_wrapped_s = wrapped_s
-                xf = np.array([progress, ey, epsi, *xc[3:]], dtype=float)
-
+                progress += ((wrapped_s - previous_s + L / 2) % L) - L / 2
+                previous_s = wrapped_s
+                xf = np.array([progress, ey, epsi, *xc[3:], acceleration])
+                shift_warm_start(solver, args.N)
                 samples += 1
-                ey_sq_sum += ey * ey
+                ey_sq_sum += ey**2
                 max_ey = max(max_ey, abs(ey))
                 solve_times.append(solve_ms)
-                lap = max(0, int(np.floor(progress / L)))
-
-                writer.writerow({
-                    "step": iteration,
-                    "time_s": samples * args.dt,
-                    "lap": lap,
-                    "s_m": progress,
-                    "X_m": xc[0],
-                    "Y_m": xc[1],
-                    "yaw_rad": xc[2],
-                    "ey_m": ey,
-                    "epsi_rad": epsi,
-                    "vx_mps": xc[3],
-                    "vy_mps": xc[4],
-                    "yaw_rate_radps": xc[5],
-                    "steering_angle_rad": xc[6],
-                    "acceleration_mps2": u0[0],
-                    "steering_rate_radps": u0[1],
-                    "solver_time_ms": solve_ms,
-                    "controller_wall_ms": wall_ms,
-                    "solver_status": status,
-                })
+                writer.writerow(dict(zip(fields, [
+                    samples - 1, samples * args.dt, max(0, int(progress // L)), progress,
+                    *xc[:3], ey, epsi, *xc[3:], acceleration, *u0, solve_ms, wall_ms, status,
+                ])))
                 if samples % 50 == 0:
                     handle.flush()
-                    print(f"step={iteration} lap={lap} ey={ey:.3f}m "
-                          f"solve={solve_ms:.2f}ms")
-
-                if viewer is not None:
-                    viewer.store(iteration, xc, u0)
-                    if iteration % args.plot_every == 0:
-                        if not viewer.redraw(iteration, solver, progress):
-                            stop_reason = "plot_closed"
-                            break
-
+                    print(f"step={samples} ey={ey:.3f}m solve={solve_ms:.2f}ms")
                 if abs(ey) > args.max_error:
                     stop_reason = "excessive_tracking_error"
-                    print(f"Lateral error {ey:.2f} m exceeds {args.max_error} m")
                     break
-
-                if args.realtime:
-                    elapsed = time.perf_counter() - loop_start
-                    time.sleep(max(0.0, args.dt - elapsed))
-
-                iteration += 1
     except KeyboardInterrupt:
         stop_reason = "keyboard_interrupt"
-        print("Interrupted; saving results")
+        print("Interrupted; saving results before visualization")
+    except Exception as error:
+        stop_reason = "exception"
+        (output / "failure.json").write_text(json.dumps({
+            "step": samples, "error": repr(error), "frenet_state": xf.tolist(),
+            "cartesian_state": xc.tolist(), **solver_diagnostics(solver),
+        }, indent=2), encoding="utf-8")
+        raise
     finally:
-        solve_times = np.asarray(solve_times, dtype=float)
         summary = {
-            "track": args.track,
-            "horizon_N": args.N,
-            "mpc_dt_s": args.dt,
-            "sim_dt_s": sim_dt,
-            "reference_speed_mps": args.speed,
-            "track_scale": args.scale,
-            "track_length_m": track["L"],
-            "simulation_type": "TUM-CONTROL PassengerVehicleSimulator",
-            "plotter": "TUM-CONTROL Mode 1" if viewer else "disabled",
-            "samples": samples,
+            "track": args.track, "horizon_N": args.N, "mpc_dt_s": args.dt,
+            "sim_dt_s": sim_dt, "reference_speed_mps": args.speed,
+            "terminal_cost": args.terminal_cost, "track_scale": args.scale,
+            "track_length_m": track["L"], "samples": samples,
             "simulated_time_s": samples * args.dt,
-            "completed_laps": max(0, int(np.floor(progress / track["L"]))),
-            "stop_reason": stop_reason,
+            "completed_laps": max(0, int(progress // track["L"])),
+            "stop_reason": stop_reason, "solver_failures": failures,
+            "recovered_solves": recovered_solves,
             "lateral_rmse_m": float(np.sqrt(ey_sq_sum / samples)) if samples else None,
-            "max_abs_lateral_error_m": float(max_ey),
+            "max_abs_lateral_error_m": max_ey,
             "mean_solver_ms": float(np.mean(solve_times)) if samples else None,
             "p95_solver_ms": float(np.percentile(solve_times, 95)) if samples else None,
             "max_solver_ms": float(np.max(solve_times)) if samples else None,
-            "solver_failures": failures,
             "wall_elapsed_s": time.perf_counter() - t0,
         }
-        (output / "summary.json").write_text(
-            json.dumps(summary, indent=2), encoding="utf-8"
-        )
-        if viewer is not None:
-            viewer.save_and_close(output / "trajectory.png")
+        (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         print(json.dumps(summary, indent=2))
         print(f"Results saved to: {output}")
+    if not args.no_plot:
+        from latch13.visualization.offline import visualize_run
+        visualize_run(output)
+    return output
 
 
-if __name__ == "__main__":
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--track", default="Silverstone")
     parser.add_argument("--N", type=int, default=38)
     parser.add_argument("--dt", type=float, default=0.08)
     parser.add_argument("--speed", type=float, default=5.0)
     parser.add_argument("--scale", type=float, default=10.0)
-    parser.add_argument("--steps", type=int, default=0,
-                        help="0 means run until interrupted")
-    parser.add_argument("--plot-every", type=int, default=5)
-    parser.add_argument("--no-plot", action="store_true")
-    parser.add_argument("--realtime", action="store_true")
+    parser.add_argument("--steps", type=int, default=1000,
+                        help="simulation steps; 0 runs until Ctrl+C, then opens visualization")
+    parser.add_argument("--plot-every", "--prediction-every", dest="plot_every", type=int, default=5,
+                        help="save a prediction snapshot every N solves; failures always saved")
+    parser.add_argument("--no-plot", action="store_true", help="save data without opening post-run plots")
     parser.add_argument("--max-error", type=float, default=8.0)
+    parser.add_argument("--terminal-cost", choices=("quadratic", "zero"), default="quadratic")
+    parser.add_argument("--output", help="explicit output directory; files inside are overwritten")
+    parser.add_argument("--replay", help="visualize a saved run directory without running MPC")
     args = parser.parse_args()
-    if args.N < 1 or args.dt <= 0 or args.speed <= 0 or args.scale <= 0:
-        parser.error("N, dt, speed and scale must be positive")
+    if args.N < 1 or not np.all(np.isfinite([args.dt, args.speed, args.scale, args.max_error])) or min(args.dt, args.speed, args.scale, args.max_error) <= 0:
+        parser.error("N, dt, speed, scale and max-error must be finite and positive")
     if args.steps < 0 or args.plot_every < 1:
-        parser.error("steps must be >= 0; plot-every must be >= 1")
-    run(args)
+        parser.error("steps must be >= 0; prediction-every must be >= 1")
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.replay:
+        from latch13.visualization.offline import visualize_run
+        visualize_run(Path(args.replay))
+    else:
+        configure_acados_environment()
+        run(args)

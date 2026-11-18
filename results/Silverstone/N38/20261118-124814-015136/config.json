@@ -1,0 +1,46 @@
+{
+  "track": "Silverstone",
+  "N": 38,
+  "dt": 0.08,
+  "speed": 5.0,
+  "scale": 10.0,
+  "steps": 10000,
+  "plot_every": 5,
+  "no_plot": false,
+  "max_error": 8.0,
+  "terminal_cost": "quadratic",
+  "output": null,
+  "replay": null,
+  "solver_options": {
+    "qp_solver": "PARTIAL_CONDENSING_HPIPM",
+    "nlp_solver_type": "SQP",
+    "hessian_approx": "EXACT",
+    "integrator_type": "ERK",
+    "sim_method_num_stages": 4,
+    "sim_method_num_steps": 4,
+    "nlp_solver_max_iter": 100,
+    "nlp_solver_tol_stat": 1e-05,
+    "nlp_solver_tol_eq": 1e-06,
+    "nlp_solver_tol_ineq": 1e-06,
+    "nlp_solver_tol_comp": 1e-06,
+    "globalization": "MERIT_BACKTRACKING",
+    "levenberg_marquardt": 0.01,
+    "print_level": 0
+  },
+  "stage_weights": {
+    "ey": 20.0,
+    "epsi": 10.0,
+    "vx": 1.0,
+    "vy": 0.1,
+    "yaw_rate": 0.1,
+    "acceleration": 0.05,
+    "jerk": 0.01,
+    "steering_rate": 0.05
+  },
+  "constraint_options": {
+    "speed_min": 1.0,
+    "speed_max": 25.0,
+    "lateral_slack_linear": null,
+    "lateral_slack_quadratic": 0.0
+  }
+}
