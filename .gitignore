@@ -12,3 +12,8 @@ events.out.**
 codegen_ocp_*/
 acados_ocp_FNMPC.json
 *:Zone.Identifier
+.venv/
+results/
+*.egg-info/
+results/
+*.egg-info/

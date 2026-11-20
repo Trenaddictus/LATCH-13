@@ -13,7 +13,10 @@ def build_frenet_model(vehicle_yaml, tire_yaml):
 
     States: [s, ey, epsi, vx, vy, r, delta, a].
     Inputs: [jerk, steering_rate], in the original TUM order.
-    Parameter: [track_curvature].
+    Parameters: [track_curvature, ey_min, ey_max]; curvature stays first.
+    ey_min/ey_max are the raceline's lateral distances to the right/left
+    track edge. The dynamics use only the curvature; the OCP builder uses the
+    edges for the track-edge constraint.
 
     The returned AcadosModel retains TUM's ``params``, initial state ``x0``,
     and bound names: ``jerk_min/max``, ``acc_min/max``, ``delta_f_min/max``,
@@ -33,7 +36,8 @@ def build_frenet_model(vehicle_yaml, tire_yaml):
         raise ValueError("Expected eight TUM state derivatives and no parameters")
 
     x = ca.MX.sym("x_frenet", 8)
-    curvature = ca.MX.sym("curvature", 1)
+    p = ca.MX.sym("p_track", 3)  # [curvature, ey_min, ey_max]
+    curvature = p[0]
     s, ey, epsi, vx, vy, r, delta, a = [x[i] for i in range(8)]
 
     # Keep the upstream control symbols and their ordering unchanged.
@@ -66,7 +70,7 @@ def build_frenet_model(vehicle_yaml, tire_yaml):
     model.x = x
     model.u = u
     model.z = tum.z
-    model.p = curvature
+    model.p = p
     model.xdot = ca.MX.sym("xdot", 8)
     model.f_expl_expr = rhs
     model.f_impl_expr = model.xdot - rhs

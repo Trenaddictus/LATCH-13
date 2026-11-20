@@ -1,7 +1,7 @@
 """Reusable Frenet NMPC formulation and acados solver construction.
 
 State: [s, ey, epsi, vx, vy, r, delta, a]; input: [jerk, steering_rate].
-Runtime stage parameters remain [track_curvature]. Long- and short-horizon
+Runtime stage parameters: [track_curvature, ey_min, ey_max]. Long- and short-horizon
 experiments use the same formulation, changing N and the terminal strategy.
 Inspired by TUM's Nominal_NMPC/NMPC_class.py and its acados settings module:
 model construction, costs, constraints, and solver creation are separate.
@@ -13,7 +13,7 @@ from typing import Protocol
 
 import casadi as ca
 import numpy as np
-from acados_template import AcadosOcp, AcadosOcpSolver
+from acados_template import ACADOS_INFTY, AcadosOcp, AcadosOcpSolver
 
 from latch13.models.frenet_model import build_frenet_model
 
@@ -70,18 +70,25 @@ def zero_terminal_cost(x, p, v_ref):
 
 @dataclass(frozen=True)
 class ConstraintOptions:
-    """Additional speed bounds, not supplied by TUM's prediction model.
+    """Speed bounds, track edges and slack penalties beyond TUM's model bounds.
 
-    All upstream model bounds remain hard constraints. Optionally soften only
+    All upstream model bounds remain hard constraints. Optionally soften
     lateral acceleration, using TUM's linear/quadratic slack penalty convention.
-    Initial state is fixed by measurement; state box bounds apply at nodes 1..N.
-    Lateral acceleration applies at nodes 0..N, including the measured state.
+    The initial state is fixed by measurement, so state bounds and nonlinear
+    constraints apply at nodes 1..N only (acados has no node-0 ``h`` here).
+
+    Track edges are always soft, with an exact L1 penalty (``linear`` must
+    exceed the constraint's multiplier) plus a small L2 term: the vehicle body,
+    half its width plus ``track_margin``, must stay between ey_min and ey_max.
     """
 
     speed_min: float = 1.0
     speed_max: float = 25.0
     lateral_slack_linear: float | None = None
     lateral_slack_quadratic: float = 0.0
+    track_margin: float = 0.3
+    track_slack_linear: float = 1e4
+    track_slack_quadratic: float = 1e1
 
 
 @dataclass(frozen=True)
@@ -100,7 +107,10 @@ class SolverOptions:
     nlp_solver_tol_eq: float = 1e-6
     nlp_solver_tol_ineq: float = 1e-6
     nlp_solver_tol_comp: float = 1e-6
-    globalization: str = "MERIT_BACKTRACKING"
+    # Funnel line search: with the soft track-edge constraints, merit
+    # backtracking repeatedly stalled at its minimum step (up to ~100 SQP
+    # iterations, sensitive to the slack weight); funnel keeps 3-5 iterations.
+    globalization: str = "FUNNEL_L1PEN_LINESEARCH"
     levenberg_marquardt: float = 1e-2
     print_level: int = 0
 
@@ -167,25 +177,35 @@ def _configure_constraints(ocp, x0, options):
     bounds.lbu = np.array([pair[0] for pair in inputs])
     bounds.ubu = np.array([pair[1] for pair in inputs])
 
+    # h = [a_lat, ey - upper edge, ey - lower edge]; edges come from p[1:3],
+    # shrunk by half the vehicle width plus the safety margin.
     lateral = model.constraint
-    lower, upper = _bound_pair(lateral.lat_acc_min, lateral.lat_acc_max, "lateral acceleration")
-    model.con_h_expr = lateral.alat(model.x)
+    lat_lower, lat_upper = _bound_pair(lateral.lat_acc_min, lateral.lat_acc_max, "lateral acceleration")
+    if not np.isfinite(options.track_margin) or options.track_margin < 0:
+        raise ValueError("Track margin must be finite and nonnegative")
+    body = 0.5 * float(model.params.veh_width) + options.track_margin
+    ey, ey_min, ey_max = model.x[1], model.p[1], model.p[2]
+    model.con_h_expr = ca.vertcat(lateral.alat(model.x), ey - (ey_max - body), ey - (ey_min + body))
     model.con_h_expr_e = model.con_h_expr
-    bounds.lh = np.array([lower])
-    bounds.uh = np.array([upper])
+    bounds.lh = np.array([lat_lower, -ACADOS_INFTY, 0.0])
+    bounds.uh = np.array([lat_upper, 0.0, ACADOS_INFTY])
     bounds.lh_e = bounds.lh.copy()
     bounds.uh_e = bounds.uh.copy()
 
+    soft = [(1, options.track_slack_linear, options.track_slack_quadratic),
+            (2, options.track_slack_linear, options.track_slack_quadratic)]
     if options.lateral_slack_linear is not None:
-        linear, quadratic = options.lateral_slack_linear, options.lateral_slack_quadratic
+        soft.insert(0, (0, options.lateral_slack_linear, options.lateral_slack_quadratic))
+    for _, linear, quadratic in soft:
         if not np.all(np.isfinite([linear, quadratic])) or min(linear, quadratic) < 0:
             raise ValueError("Slack penalties must be finite and nonnegative")
         if linear == quadratic == 0:
-            raise ValueError("Soft lateral constraints require a positive penalty")
-        for suffix in ("", "_e"):
-            setattr(bounds, "idxsh" + suffix, np.array([0], dtype=int))
-            for name, value in (("zl", linear), ("zu", linear), ("Zl", quadratic), ("Zu", quadratic)):
-                setattr(ocp.cost, name + suffix, np.array([value]))
+            raise ValueError("Soft constraints require a positive penalty")
+    index, linear, quadratic = (np.array(column) for column in zip(*soft))
+    for suffix in ("", "_e"):
+        setattr(bounds, "idxsh" + suffix, index.astype(int))
+        for name, value in (("zl", linear), ("zu", linear), ("Zl", quadratic), ("Zu", quadratic)):
+            setattr(ocp.cost, name + suffix, value.astype(float))
 
     bounds.x0 = x0
 
@@ -217,14 +237,15 @@ def build_ocp(
 
     ocp = AcadosOcp()
     ocp.model = build_frenet_model(vehicle_file, tire_file)
-    if (ocp.model.x.numel(), ocp.model.u.numel(), ocp.model.p.numel()) != (8, 2, 1):
-        raise ValueError("Expected eight states, two controls, and one curvature parameter")
+    if (ocp.model.x.numel(), ocp.model.u.numel(), ocp.model.p.numel()) != (8, 2, 3):
+        raise ValueError("Expected eight states, two controls, and [curvature, ey_min, ey_max]")
     _configure_costs(
         ocp, float(v_ref), stage_weights if stage_weights is not None else StageCostWeights(),
         terminal_cost if terminal_cost is not None else QuadraticTerminalCost(),
     )
     _configure_constraints(ocp, x0, constraints if constraints is not None else ConstraintOptions())
-    ocp.parameter_values = np.zeros(1)
+    # Placeholder until the runner sets per-stage values: straight, wide track.
+    ocp.parameter_values = np.array([0.0, -1e3, 1e3])
     options = solver_options if solver_options is not None else SolverOptions()
     for name, value in vars(options).items():
         setattr(ocp.solver_options, name, value)

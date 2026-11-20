@@ -2,7 +2,8 @@
 
 MPC state: [s, ey, epsi, vx, vy, r, delta, a]. Inputs: [jerk, steering_rate].
 The independent TUM plant uses seven Cartesian states and [a, steering_rate].
-No plotting occurs during optimization or plant integration.
+No plotting occurs during optimization or plant integration. --live [1|2] opts
+in to TUM-CONTROL's Mode 1 or Mode 2 live view, drawn outside solver timing.
 Use --replay RUN_DIRECTORY to inspect a saved run without rebuilding acados.
 """
 
@@ -16,7 +17,6 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from scipy.ndimage import gaussian_filter1d
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,125 +56,6 @@ def configure_acados_environment():
             [str(library_dir)] + [path for path in paths if path]
         )
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
-
-
-def numeric_csv(path, min_cols):
-    """Read numeric CSV rows; tolerate comments, headers, comma/semicolon."""
-    rows = []
-    with open(path, encoding="utf-8-sig") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            sep = ";" if ";" in line else ","
-            parts = [part.strip() for part in line.split(sep)]
-            try:
-                values = [float(item) for item in parts[:min_cols]]
-            except ValueError:
-                continue
-            if len(values) == min_cols and np.all(np.isfinite(values)):
-                rows.append(values)
-    if len(rows) < 5:
-        raise ValueError(f"Not enough numeric rows in {path}")
-    return np.asarray(rows, dtype=float)
-
-
-def load_track(name, scale):
-    """Read the raceline, then construct closed-loop segment geometry."""
-    path = TRACK_ROOT / name / f"{name}_raceline.csv"
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing raceline: {path}")
-    data = numeric_csv(path, 7)
-    points = data[:, 1:3] * scale
-    if np.linalg.norm(points[-1] - points[0]) < 1e-6:
-        points = points[:-1]
-
-    segments = np.roll(points, -1, axis=0) - points
-    lengths = np.linalg.norm(segments, axis=1)
-    if np.any(lengths <= 1e-7):
-        raise ValueError("Raceline has duplicate adjacent coordinates")
-
-    s = np.r_[0.0, np.cumsum(lengths[:-1])]
-    lap_length = float(lengths.sum())
-    dx = np.gradient(points[:, 0], s)
-    dy = np.gradient(points[:, 1], s)
-    ddx = np.gradient(dx, s)
-    ddy = np.gradient(dy, s)
-    kappa = (dx * ddy - dy * ddx) / np.maximum(
-        (dx * dx + dy * dy) ** 1.5, 1e-8
-    )
-    kappa = gaussian_filter1d(kappa, sigma=3.0, mode="wrap")
-
-    return {
-        "points": points,
-        "x": points[:, 0],
-        "y": points[:, 1],
-        "segments": segments,
-        "segment_lengths": lengths,
-        "s": s,
-        "kappa": kappa,
-        "L": lap_length,
-    }
-
-
-def curvature(track, progress):
-    return float(np.interp(
-        progress % track["L"],
-        np.r_[track["s"], track["L"]],
-        np.r_[track["kappa"], track["kappa"][0]],
-    ))
-
-
-def reference_pose(track, progress):
-    """Piecewise-linear Frenet reference X, Y, heading."""
-    progress = float(progress % track["L"])
-    index = int(np.searchsorted(track["s"], progress, side="right") - 1)
-    index = max(0, min(index, len(track["s"]) - 1))
-    length = track["segment_lengths"][index]
-    alpha = np.clip((progress - track["s"][index]) / length, 0.0, 1.0)
-    segment = track["segments"][index]
-    xy = track["points"][index] + alpha * segment
-    heading = np.arctan2(segment[1], segment[0])
-    return float(xy[0]), float(xy[1]), float(heading)
-
-
-def project(track, X, Y, heading):
-    """Project a Cartesian pose onto the closed raceline."""
-    p = np.array([X, Y], dtype=float)
-    start = track["points"]
-    tangent = track["segments"]
-    squared = np.maximum(np.einsum("ij,ij->i", tangent, tangent), 1e-12)
-    alpha = np.clip(
-        np.einsum("ij,ij->i", p - start, tangent) / squared, 0.0, 1.0
-    )
-    candidates = start + alpha[:, None] * tangent
-    index = int(np.argmin(np.sum((candidates - p) ** 2, axis=1)))
-    d = tangent[index]
-    offset = p - candidates[index]
-    length = track["segment_lengths"][index]
-    ey = (d[0] * offset[1] - d[1] * offset[0]) / length
-    psi_ref = np.arctan2(d[1], d[0])
-    epsi = np.arctan2(np.sin(heading - psi_ref), np.cos(heading - psi_ref))
-    s = (track["s"][index] + alpha[index] * length) % track["L"]
-    return float(s), float(ey), float(epsi)
-
-
-def load_centerline_boundaries(name, scale):
-    """F1TENTH centerline: x, y, width_right, width_left."""
-    path = TRACK_ROOT / name / f"{name}_centerline.csv"
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing centerline: {path}")
-    data = numeric_csv(path, 4)
-    center = data[:, :2] * scale
-    if np.linalg.norm(center[-1] - center[0]) < 1e-6:
-        center = center[:-1]
-        data = data[:-1]
-    tangent = np.roll(center, -1, axis=0) - np.roll(center, 1, axis=0)
-    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-12)
-    normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
-    right = center - (data[:, 2] * scale)[:, None] * normal
-    left = center + (data[:, 3] * scale)[:, None] * normal
-    return center, left, right
 
 
 def create_simulator(mpc_dt):
@@ -238,12 +119,30 @@ def shift_warm_start(solver, N):
     solver.set(N, "x", states[-1])
 
 
+def stage_parameters(track, progress, N, dt, speed):
+    """Per-stage [curvature, ey_min, ey_max] at constant-speed predicted progress."""
+    s = progress + np.arange(N + 1) * dt * speed
+    return np.column_stack((track.curvature(s), *track.edges(s)))
+
+
+def track_margin(track, s, ey, half_width):
+    """Distance from the vehicle body to the nearer track edge; negative outside."""
+    ey_min, ey_max = track.edges(s)
+    return float(min(ey_max - half_width - ey, ey - ey_min - half_width))
+
+
+def max_slack(solver, N):
+    """Largest soft-constraint slack over nodes 1..N (node 0 has none)."""
+    values = [np.r_[solver.get(j, "sl"), solver.get(j, "su")] for j in range(1, N + 1)]
+    return float(max(np.max(v) if v.size else 0.0 for v in values))
+
+
 def prediction_snapshot(solver, N, parameters):
-    """Rows contain eight states, two controls, and curvature; terminal u is NaN."""
-    snapshot = np.full((N + 1, 11), np.nan)
+    """Rows: eight states, two controls, [curvature, ey_min, ey_max]; terminal u is NaN."""
+    snapshot = np.full((N + 1, 13), np.nan)
     for j in range(N + 1):
         snapshot[j, :8] = np.asarray(solver.get(j, "x")).reshape(8)
-        snapshot[j, 10] = parameters[j]
+        snapshot[j, 10:] = parameters[j]
         if j < N:
             snapshot[j, 8:10] = np.asarray(solver.get(j, "u")).reshape(2)
     return snapshot
@@ -276,8 +175,8 @@ def solve_with_recovery(solver, xf, parameters, N, dt, speed):
             initialize_solver(solver, xf, N, dt, speed)
         solver.constraints_set(0, "lbx", xf)
         solver.constraints_set(0, "ubx", xf)
-        for j, kappa in enumerate(parameters):
-            solver.set(j, "p", np.array([kappa]))
+        for j, stage in enumerate(parameters):
+            solver.set(j, "p", stage)
         status = int(solver.solve())
         details = solver_diagnostics(solver)
         total_solver_ms += float(np.asarray(details["time_tot"]).reshape(-1)[0]) * 1000
@@ -306,41 +205,56 @@ def run(args):
     from latch13.controllers.ocp import (
         ConstraintOptions, SolverOptions, StageCostWeights, build_mpc, zero_terminal_cost,
     )
+    from latch13.tracks.f1tenth import load_track
 
-    track = load_track(args.track, args.scale)
+    track = load_track(TRACK_ROOT, args.track, args.scale)
     output = Path(args.output).resolve() if args.output else (
         ROOT / "results" / args.track / f"N{args.N}" /
         datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     )
     output.mkdir(parents=True, exist_ok=True)
     # Save geometry so replay needs neither track CSVs nor the solver.
-    center, left, right = load_centerline_boundaries(args.track, args.scale)
-    np.savez(output / "track.npz", **track, center=center, left=left, right=right)
+    track.to_npz(output / "track.npz")
+    constraints = ConstraintOptions(track_margin=args.track_margin)
     (output / "config.json").write_text(json.dumps({
         **vars(args), "solver_options": asdict(SolverOptions()),
         "stage_weights": asdict(StageCostWeights()),
-        "constraint_options": asdict(ConstraintOptions()),
+        "constraint_options": asdict(constraints),
     }, indent=2), encoding="utf-8")
 
-    yaw0 = float(np.arctan2(*track["segments"][0][::-1]))
-    xc = np.array([track["x"][0], track["y"][0], yaw0, args.speed, 0, 0, 0.])
+    yaw0 = float(np.arctan2(*track.segments[0][::-1]))
+    xc = np.array([*track.points[0], yaw0, args.speed, 0, 0, 0.])
     xf = np.array([0, 0, 0, args.speed, 0, 0, 0, 0.])
     terminal = zero_terminal_cost if args.terminal_cost == "zero" else None
     solver = build_mpc(
         TUM_CONFIG, xf, N=args.N, dt=args.dt, v_ref=args.speed,
-        output_dir=output / "solver", terminal_cost=terminal,
+        output_dir=output / "solver", terminal_cost=terminal, constraints=constraints,
     )
     initialize_solver(solver, xf, args.N, args.dt, args.speed)
     simulator, sim_dt, substeps = create_simulator(args.dt)
     print(f"Eight-state Frenet MPC: N={args.N}, horizon={args.N * args.dt:.2f}s")
     print(f"Plant dt={sim_dt}s, MPC dt={args.dt}s; plotting after simulation")
     print(f"Results: {output}")
+    live = None
+    if args.live:
+        from latch13.visualization.live import LIVE_VIEWS
+        # Same vehicle file as the OCP bounds; Mode 2 normalises by these limits.
+        with open(TUM_CONFIG / "veh_params_pred.yaml", encoding="utf-8") as f:
+            limits = yaml.safe_load(f)
+        live = LIVE_VIEWS[args.live](
+            track, xc, xf, simulator.params, limits,
+            horizon=args.N, dt=args.dt, speed=args.speed, rate=args.live_rate,
+            title=f"{args.track} | N={args.N} | v_ref={args.speed} m/s",
+        )
 
     fields = [
         "step", "time_s", "lap", "s_m", "X_m", "Y_m", "yaw_rad", "ey_m", "epsi_rad",
         "vx_mps", "vy_mps", "yaw_rate_radps", "steering_angle_rad", "acceleration_mps2",
         "jerk_mps3", "steering_rate_radps", "solver_time_ms", "controller_wall_ms", "solver_status",
+        "track_margin_m", "max_slack",
     ]
+    half_width = 0.5 * float(simulator.params.veh_width)
+    margins, slacks = [], []
     samples, progress, previous_s, failures = 0, 0.0, 0.0, 0
     recovered_solves = 0
     ey_sq_sum, max_ey = 0.0, 0.0
@@ -355,12 +269,11 @@ def run(args):
             writer.writeheader()
             writer.writerow(dict(zip(fields, [
                 -1, 0, 0, 0, *xc[:3], 0, 0, *xc[3:], 0,
-                0, 0, 0, 0, -1,
+                0, 0, 0, 0, -1, track_margin(track, 0.0, 0.0, half_width), 0,
             ])))
             while args.steps == 0 or samples < args.steps:
                 loop_start = time.perf_counter()
-                parameters = [curvature(track, xf[0] + j * args.dt * args.speed)
-                              for j in range(args.N + 1)]
+                parameters = stage_parameters(track, xf[0], args.N, args.dt, args.speed)
                 status, attempts, solve_ms = solve_with_recovery(
                     solver, xf, parameters, args.N, args.dt, args.speed,
                 )
@@ -368,8 +281,9 @@ def run(args):
                     recovered_solves += 1
                     print(f"Recovered solver at step {samples} after cold restart")
                 wall_ms = (time.perf_counter() - loop_start) * 1000
+                slack = max_slack(solver, args.N)
                 info = {"step": samples, "time_s": samples * args.dt,
-                        "status": status, "frenet_state": xf.tolist(),
+                        "status": status, "frenet_state": xf.tolist(), "max_slack": slack,
                         "attempts": attempts, "total_solver_ms": solve_ms,
                         **solver_diagnostics(solver)}
                 if status != 0 or samples % args.plot_every == 0 or samples + 1 == args.steps:
@@ -382,28 +296,45 @@ def run(args):
                     stop_reason = f"solver_status_{status}"
                     print(f"Solver failed at step {samples}: status {status}")
                     break
+                if live is not None and samples % args.live_every == 0:
+                    # Before the warm-start shift, so the prediction matches xc.
+                    snapshot = prediction_snapshot(solver, args.N, parameters)
+                    if not live.draw(samples * args.dt, xf, snapshot, solve_ms):
+                        stop_reason = "live_view_closed"
+                        break
 
                 u0 = np.asarray(solver.get(0, "u"), dtype=float).reshape(2)
                 if not np.all(np.isfinite(u0)):
                     raise ValueError("Nonfinite optimized control")
                 xc, acceleration = advance_plant(simulator, xc, xf[7], u0, sim_dt, substeps)
-                wrapped_s, ey, epsi = project(track, *xc[:3])
-                L = track["L"]
+                wrapped_s, ey, epsi = track.project(*xc[:3])
+                L = track.length
                 progress += ((wrapped_s - previous_s + L / 2) % L) - L / 2
                 previous_s = wrapped_s
                 xf = np.array([progress, ey, epsi, *xc[3:], acceleration])
+                if live is not None:
+                    live.record(xc, xf)
                 shift_warm_start(solver, args.N)
                 samples += 1
                 ey_sq_sum += ey**2
                 max_ey = max(max_ey, abs(ey))
                 solve_times.append(solve_ms)
+                margins.append(track_margin(track, wrapped_s, ey, half_width))
+                slacks.append(slack)
                 writer.writerow(dict(zip(fields, [
                     samples - 1, samples * args.dt, max(0, int(progress // L)), progress,
                     *xc[:3], ey, epsi, *xc[3:], acceleration, *u0, solve_ms, wall_ms, status,
+                    margins[-1], slack,
                 ])))
                 if samples % 50 == 0:
                     handle.flush()
                     print(f"step={samples} ey={ey:.3f}m solve={solve_ms:.2f}ms")
+                if margins[-1] < 0 and not args.allow_off_track:
+                    # Vehicle body crossed a track edge (ROADMAP D3).
+                    stop_reason = "left_track"
+                    print(f"Left the track at step {samples - 1}, s={progress:.1f} m: "
+                          f"body {-margins[-1]:.2f} m beyond the edge")
+                    break
                 if abs(ey) > args.max_error:
                     stop_reason = "excessive_tracking_error"
                     break
@@ -418,13 +349,15 @@ def run(args):
         }, indent=2), encoding="utf-8")
         raise
     finally:
+        if live is not None:
+            live.close()
         summary = {
             "track": args.track, "horizon_N": args.N, "mpc_dt_s": args.dt,
             "sim_dt_s": sim_dt, "reference_speed_mps": args.speed,
             "terminal_cost": args.terminal_cost, "track_scale": args.scale,
-            "track_length_m": track["L"], "samples": samples,
+            "track_length_m": track.length, "samples": samples,
             "simulated_time_s": samples * args.dt,
-            "completed_laps": max(0, int(progress // track["L"])),
+            "completed_laps": max(0, int(progress // track.length)),
             "stop_reason": stop_reason, "solver_failures": failures,
             "recovered_solves": recovered_solves,
             "lateral_rmse_m": float(np.sqrt(ey_sq_sum / samples)) if samples else None,
@@ -432,6 +365,10 @@ def run(args):
             "mean_solver_ms": float(np.mean(solve_times)) if samples else None,
             "p95_solver_ms": float(np.percentile(solve_times, 95)) if samples else None,
             "max_solver_ms": float(np.max(solve_times)) if samples else None,
+            "track_margin_option_m": constraints.track_margin,
+            "min_track_margin_m": float(np.min(margins)) if samples else None,
+            "track_violation_steps": int(np.sum(np.asarray(margins) < 0)),
+            "max_slack": float(np.max(slacks)) if samples else None,
             "wall_elapsed_s": time.perf_counter() - t0,
         }
         (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -455,15 +392,31 @@ def parse_args():
     parser.add_argument("--plot-every", "--prediction-every", dest="plot_every", type=int, default=5,
                         help="save a prediction snapshot every N solves; failures always saved")
     parser.add_argument("--no-plot", action="store_true", help="save data without opening post-run plots")
+    parser.add_argument("--live", nargs="?", type=int, choices=(1, 2), const=1, metavar="MODE",
+                        help="live TUM-CONTROL view during simulation: 1 = track (default), "
+                             "2 = track, speed, deviation and g-g; closing it stops the run")
+    parser.add_argument("--live-every", type=int, default=1,
+                        help="redraw the live view every N solves")
+    parser.add_argument("--live-rate", type=float,
+                        help="pace the live view to this multiple of real time (1 = real time); "
+                             "default runs as fast as possible")
     parser.add_argument("--max-error", type=float, default=8.0)
+    parser.add_argument("--track-margin", type=float, default=0.3,
+                        help="safety margin between vehicle body and track edge in the MPC [m]")
+    parser.add_argument("--allow-off-track", action="store_true",
+                        help="keep running after the vehicle body crosses a track edge")
     parser.add_argument("--terminal-cost", choices=("quadratic", "zero"), default="quadratic")
     parser.add_argument("--output", help="explicit output directory; files inside are overwritten")
     parser.add_argument("--replay", help="visualize a saved run directory without running MPC")
     args = parser.parse_args()
     if args.N < 1 or not np.all(np.isfinite([args.dt, args.speed, args.scale, args.max_error])) or min(args.dt, args.speed, args.scale, args.max_error) <= 0:
         parser.error("N, dt, speed, scale and max-error must be finite and positive")
-    if args.steps < 0 or args.plot_every < 1:
-        parser.error("steps must be >= 0; prediction-every must be >= 1")
+    if args.steps < 0 or args.plot_every < 1 or args.live_every < 1:
+        parser.error("steps must be >= 0; prediction-every and live-every must be >= 1")
+    if not (np.isfinite(args.track_margin) and args.track_margin >= 0):
+        parser.error("track-margin must be finite and nonnegative")
+    if args.live_rate is not None and not (np.isfinite(args.live_rate) and args.live_rate > 0):
+        parser.error("live-rate must be finite and positive")
     return args
 
 

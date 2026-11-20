@@ -4,3 +4,6 @@
 [submodule "external/f1tenth_racetracks"]
 	path = external/f1tenth_racetracks
 	url = https://github.com/f1tenth/f1tenth_racetracks.git
+[submodule "external/leap-c"]
+	path = external/leap-c
+	url = https://github.com/leap-c/leap-c.git
