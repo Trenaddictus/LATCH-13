@@ -28,13 +28,11 @@ class _LiveView:
     mode, panel_every = None, None
 
     def __init__(self, track, cartesian_state, frenet_state, vehicle, limits, *,
-                 horizon, dt, speed, rate=None, window=100.0,
-                 title="Frenet MPC"):
+                 dt, rate=None, window=100.0, title="Frenet MPC"):
         import matplotlib.pyplot as plt
 
         self.plt = plt
-        self.track, self.dt, self.speed, self.rate = track, dt, float(speed), rate
-        self.offsets = np.arange(horizon + 1) * dt
+        self.track, self.dt, self.rate = track, dt, rate
         self.size = (float(vehicle.veh_length), float(vehicle.veh_width))
         self.window = float(window)
         self.limits = limits
@@ -42,11 +40,13 @@ class _LiveView:
                                 for edge in (track.center, track.left, track.right))
         self.step, self.frames, self.clock = 0, 0, None
         # Rows are steps: plant state (TUM's seven), raceline reference
-        # [X, Y, yaw, v_ref] at the projected progress, and acceleration state.
+        # [X, Y, yaw, planned speed] at the projected progress (there is no
+        # reference speed; TUM's "reference" speed line shows the MPC's plan
+        # for the next step), and the acceleration state.
         self.history = {"states": np.full((2048, 7), np.nan),
                         "references": np.full((2048, 4), np.nan),
                         "acceleration": np.zeros(2048)}
-        self._store(cartesian_state, frenet_state)
+        self._store(cartesian_state, frenet_state, cartesian_state[3])
         # TUM's state-estimation disturbances and applied inputs are not
         # simulated here; NaN rows keep the disturbed-state line empty.
         self.disturbed = np.full((1, 7), np.nan)
@@ -84,7 +84,7 @@ class _LiveView:
     def panels_due(self):
         return bool(self.panel_every) and self.frames % self.panel_every == 0
 
-    def _store(self, cartesian_state, frenet_state):
+    def _store(self, cartesian_state, frenet_state, planned_speed):
         if self.step >= len(self.states):
             for name, old in self.history.items():
                 grown = np.full((2 * len(old), *old.shape[1:]), np.nan)
@@ -92,12 +92,12 @@ class _LiveView:
                 self.history[name] = grown
         xy, yaw, _ = self.track.pose(frenet_state[0])
         self.history["states"][self.step] = cartesian_state
-        self.history["references"][self.step] = [*xy, yaw, self.speed]
+        self.history["references"][self.step] = [*xy, yaw, planned_speed]
         self.history["acceleration"][self.step] = frenet_state[7]
 
-    def record(self, cartesian_state, frenet_state):
+    def record(self, cartesian_state, frenet_state, planned_speed):
         self.step += 1
-        self._store(cartesian_state, frenet_state)
+        self._store(cartesian_state, frenet_state, planned_speed)
 
     def draw(self, time_s, frenet_state, prediction, solve_ms):
         """Redraw for the latest recorded state and the prediction made from it."""
@@ -105,7 +105,8 @@ class _LiveView:
             return False
         self._pace(time_s)
         self.frames += 1
-        xy, yaw, index = self.track.pose(frenet_state[0] + self.offsets * self.speed)
+        # Raceline at the MPC's predicted progress; TUM's camera frames from it.
+        xy, yaw, index = self.track.pose(prediction[:, 0])
         reference = {"pos_x": xy[:, 0], "pos_y": xy[:, 1], "ref_yaw": yaw}
         self._update(time_s, reference, self.track.cartesian(prediction[:, 0], prediction[:, 1]),
                      int(index[0]))

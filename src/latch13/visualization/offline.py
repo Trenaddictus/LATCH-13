@@ -51,7 +51,11 @@ def visualize_run(directory, *, show=True):
     errors.plot(times, data["ey_m"], label="Lateral error [m]")
     errors.plot(times, data["epsi_rad"], label="Heading error [rad]")
     speed.plot(times, data["vx_mps"], label="Longitudinal speed [m/s]")
-    speed.axhline(summary["reference_speed_mps"], color="0.5", linestyle="--", label="Target speed")
+    if "reference_speed_mps" in summary:  # runs before ROADMAP step 3 tracked a constant v_ref
+        speed.axhline(summary["reference_speed_mps"], color="0.5", linestyle="--", label="Target speed")
+    if "speed_limit_mps" in summary:
+        speed.axhline(summary["speed_limit_mps"], color="r", linestyle="--", linewidth=0.8,
+                      label="Speed limit")
     acceleration.plot(times, data["acceleration_mps2"], label="Acceleration state [m/s²]")
     controls.step(times[1:], data["jerk_mps3"][1:], where="pre", label="Jerk [m/s³]")
     controls.step(times[1:], data["steering_rate_radps"][1:], where="pre", label="Steering rate [rad/s]")

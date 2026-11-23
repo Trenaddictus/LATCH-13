@@ -7,3 +7,9 @@
 [submodule "external/leap-c"]
 	path = external/leap-c
 	url = https://github.com/leap-c/leap-c.git
+[submodule "external/leap-c-lab"]
+	path = external/leap-c-lab
+	url = https://github.com/leap-c/leap-c-lab.git
+[submodule "external/mpc-sac"]
+	path = external/mpc-sac
+	url = https://github.com/leap-c/mpc-sac.git

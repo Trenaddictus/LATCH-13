@@ -2,8 +2,11 @@
 
 MPC state: [s, ey, epsi, vx, vy, r, delta, a]. Inputs: [jerk, steering_rate].
 The independent TUM plant uses seven Cartesian states and [a, steering_rate].
-No plotting occurs during optimization or plant integration. --live [1|2] opts
+There is no reference speed: the MPC rewards progress (--progress-weight), and
+--v-init only sets the start speed and the cold-start guess. No plotting occurs during optimization or plant integration. --live [1|2] opts
 in to TUM-CONTROL's Mode 1 or Mode 2 live view, drawn outside solver timing.
+--controller leapc runs the same loop with the Leap-C MPC at the fixed Phase 1
+terminal cost; leapc-unshifted also uses the warm start of the RL training.
 Use --replay RUN_DIRECTORY to inspect a saved run without rebuilding acados.
 """
 
@@ -58,135 +61,10 @@ def configure_acados_environment():
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
-def create_simulator(mpc_dt):
-    from Vehicle_Simulator.VehicleSimulator import PassengerVehicleSimulator
-
-    with open(TUM_CONFIG / "sim_main_params.yaml", encoding="utf-8") as f:
-        sim_config = yaml.safe_load(f)
-    sim_dt = float(sim_config["Ts"])
-    ratio = mpc_dt / sim_dt
-    substeps = int(round(ratio))
-    if substeps < 1 or not np.isclose(ratio, substeps, atol=1e-10):
-        raise ValueError(f"MPC dt={mpc_dt} is not a multiple of sim dt={sim_dt}")
-
-    # TUM YAML paths include 'EDGAR/' already; provide parent Config/.
-    vehicle = PassengerVehicleSimulator(
-        config_path=str(TUM_CONFIG.parent) + "/",
-        sim_main_params=sim_config,
-        Ts=sim_dt,
-    )
-    return vehicle, sim_dt, substeps
-
-
-def advance_plant(simulator, cartesian_state, acceleration, control, sim_dt, substeps):
-    """Apply constant jerk using a midpoint acceleration at each plant substep.
-
-    Acceleration is an ideal commanded actuator state: a_dot = jerk. TUM's
-    seven-state plant has no acceleration actuator state of its own. Midpoint
-    sampling approximates the ramp inside each substep; no clipping changes the
-    optimized input. Return the endpoint acceleration for the next MPC state.
-    """
-    jerk, steering_rate = np.asarray(control, dtype=float).reshape(2)
-    state = np.asarray(cartesian_state, dtype=float).copy()
-    for _ in range(substeps):
-        midpoint_acceleration = acceleration + 0.5 * sim_dt * jerk
-        state = np.asarray(simulator.simulator_step(
-            state, np.array([midpoint_acceleration, steering_rate])
-        ), dtype=float).reshape(-1)
-        acceleration += sim_dt * jerk
-        if state.shape != (7,) or not np.all(np.isfinite(state)):
-            raise ValueError("Invalid Cartesian plant state")
-    return state, float(acceleration)
-
-
-def initialize_solver(solver, xf, N, dt, speed):
-    for j in range(N + 1):
-        guess = xf.copy()
-        guess[0] += j * dt * speed
-        solver.set(j, "x", guess)
-        if j < N:
-            solver.set(j, "u", np.zeros(2))
-
-
-def shift_warm_start(solver, N):
-    """Move the last optimized trajectory forward by one controller interval."""
-    states = [solver.get(j, "x") for j in range(1, N + 1)]
-    controls = [solver.get(j, "u") for j in range(1, N)]
-    controls.append(solver.get(N - 1, "u"))
-    for j in range(N):
-        solver.set(j, "x", states[j])
-        solver.set(j, "u", controls[j])
-    solver.set(N, "x", states[-1])
-
-
-def stage_parameters(track, progress, N, dt, speed):
-    """Per-stage [curvature, ey_min, ey_max] at constant-speed predicted progress."""
-    s = progress + np.arange(N + 1) * dt * speed
-    return np.column_stack((track.curvature(s), *track.edges(s)))
-
-
-def track_margin(track, s, ey, half_width):
-    """Distance from the vehicle body to the nearer track edge; negative outside."""
-    ey_min, ey_max = track.edges(s)
-    return float(min(ey_max - half_width - ey, ey - ey_min - half_width))
-
-
 def max_slack(solver, N):
     """Largest soft-constraint slack over nodes 1..N (node 0 has none)."""
     values = [np.r_[solver.get(j, "sl"), solver.get(j, "su")] for j in range(1, N + 1)]
     return float(max(np.max(v) if v.size else 0.0 for v in values))
-
-
-def prediction_snapshot(solver, N, parameters):
-    """Rows: eight states, two controls, [curvature, ey_min, ey_max]; terminal u is NaN."""
-    snapshot = np.full((N + 1, 13), np.nan)
-    for j in range(N + 1):
-        snapshot[j, :8] = np.asarray(solver.get(j, "x")).reshape(8)
-        snapshot[j, 10:] = parameters[j]
-        if j < N:
-            snapshot[j, 8:10] = np.asarray(solver.get(j, "u")).reshape(2)
-    return snapshot
-
-
-def solver_diagnostics(solver):
-    """Best-effort diagnostics must not hide the original failure."""
-    result = {}
-    for name in ("time_tot", "nlp_iter", "residuals"):
-        try:
-            value = solver.get_residuals() if name == "residuals" else solver.get_stats(name)
-            result[name] = np.asarray(value).tolist()
-        except Exception as error:
-            result[name] = {"unavailable": str(error)}
-    return result
-
-
-def solve_with_recovery(solver, xf, parameters, N, dt, speed):
-    """Solve once, then try one cold restart at the SAME measured state.
-
-    Record rejected iterates before reset. No failed solution is applied to the
-    plant. This follows TUM's reinitialization approach, but requires a successful
-    retry rather than continuing with the failed solve's first control.
-    """
-    attempts = []
-    total_solver_ms = 0.0
-    for attempt in range(2):
-        if attempt:
-            solver.reset()
-            initialize_solver(solver, xf, N, dt, speed)
-        solver.constraints_set(0, "lbx", xf)
-        solver.constraints_set(0, "ubx", xf)
-        for j, stage in enumerate(parameters):
-            solver.set(j, "p", stage)
-        status = int(solver.solve())
-        details = solver_diagnostics(solver)
-        total_solver_ms += float(np.asarray(details["time_tot"]).reshape(-1)[0]) * 1000
-        details["status"] = status
-        if status != 0:
-            details["rejected_prediction"] = prediction_snapshot(solver, N, parameters).tolist()
-        attempts.append(details)
-        if status == 0:
-            break
-    return status, attempts, total_solver_ms
 
 
 def run(args):
@@ -205,6 +83,11 @@ def run(args):
     from latch13.controllers.ocp import (
         ConstraintOptions, SolverOptions, StageCostWeights, build_mpc, zero_terminal_cost,
     )
+    from latch13.simulation.closed_loop import (
+        constant_speed_progress, initialize_solver, prediction_snapshot, shift_warm_start,
+        shifted_progress, solve_with_recovery, solver_diagnostics, stage_parameters,
+    )
+    from latch13.simulation.plant import ClosedLoopPlant
     from latch13.tracks.f1tenth import load_track
 
     track = load_track(TRACK_ROOT, args.track, args.scale)
@@ -216,22 +99,33 @@ def run(args):
     # Save geometry so replay needs neither track CSVs nor the solver.
     track.to_npz(output / "track.npz")
     constraints = ConstraintOptions(track_margin=args.track_margin)
+    stage_weights = StageCostWeights(progress=args.progress_weight)
     (output / "config.json").write_text(json.dumps({
         **vars(args), "solver_options": asdict(SolverOptions()),
-        "stage_weights": asdict(StageCostWeights()),
+        "stage_weights": asdict(stage_weights),
         "constraint_options": asdict(constraints),
     }, indent=2), encoding="utf-8")
 
-    yaw0 = float(np.arctan2(*track.segments[0][::-1]))
-    xc = np.array([*track.points[0], yaw0, args.speed, 0, 0, 0.])
-    xf = np.array([0, 0, 0, args.speed, 0, 0, 0, 0.])
+    plant = ClosedLoopPlant(TUM_CONFIG, track, args.dt)
+    plant.reset([0, 0, 0, args.v_init, 0, 0, 0, 0])
+    xc, xf = plant.cartesian, plant.frenet
     terminal = zero_terminal_cost if args.terminal_cost == "zero" else None
-    solver = build_mpc(
-        TUM_CONFIG, xf, N=args.N, dt=args.dt, v_ref=args.speed,
-        output_dir=output / "solver", terminal_cost=terminal, constraints=constraints,
-    )
-    initialize_solver(solver, xf, args.N, args.dt, args.speed)
-    simulator, sim_dt, substeps = create_simulator(args.dt)
+    if args.controller == "acados":
+        solver = build_mpc(
+            TUM_CONFIG, xf, N=args.N, dt=args.dt, output_dir=output / "solver",
+            stage_weights=stage_weights, terminal_cost=terminal, constraints=constraints,
+        )
+    else:
+        from latch13.controllers.leapc_fixed import build_fixed_theta_solver
+        # Stable directory, so compiled code is reused; acados rebuilds it if the OCP changes.
+        generated = (ROOT / "results" / "generated" / "leapc" / "closed_loop" /
+                     f"N{args.N}_dt{args.dt}_q{args.progress_weight}_m{args.track_margin}")
+        solver = build_fixed_theta_solver(
+            TUM_CONFIG, generated, N=args.N, dt=args.dt, shift=args.controller == "leapc",
+            stage_weights=stage_weights, constraints=constraints,
+        )
+    initialize_solver(solver, xf, args.N, args.dt)
+    simulator, sim_dt = plant.simulator, plant.sim_dt
     print(f"Eight-state Frenet MPC: N={args.N}, horizon={args.N * args.dt:.2f}s")
     print(f"Plant dt={sim_dt}s, MPC dt={args.dt}s; plotting after simulation")
     print(f"Results: {output}")
@@ -242,9 +136,8 @@ def run(args):
         with open(TUM_CONFIG / "veh_params_pred.yaml", encoding="utf-8") as f:
             limits = yaml.safe_load(f)
         live = LIVE_VIEWS[args.live](
-            track, xc, xf, simulator.params, limits,
-            horizon=args.N, dt=args.dt, speed=args.speed, rate=args.live_rate,
-            title=f"{args.track} | N={args.N} | v_ref={args.speed} m/s",
+            track, xc, xf, simulator.params, limits, dt=args.dt, rate=args.live_rate,
+            title=f"{args.track} | N={args.N} | progress weight {args.progress_weight}",
         )
 
     fields = [
@@ -253,9 +146,12 @@ def run(args):
         "jerk_mps3", "steering_rate_radps", "solver_time_ms", "controller_wall_ms", "solver_status",
         "track_margin_m", "max_slack",
     ]
-    half_width = 0.5 * float(simulator.params.veh_width)
-    margins, slacks = [], []
-    samples, progress, previous_s, failures = 0, 0.0, 0.0, 0
+    margins, slacks, speeds = [], [], []
+    samples, progress, failures = 0, 0.0, 0
+    lap_time = None
+    # Stage progress for the parameter lookup: constant-speed guess first,
+    # then the previous solution's predicted s, shifted by one stage.
+    horizon_s = constant_speed_progress(xf[0], args.N, args.dt, args.v_init)
     recovered_solves = 0
     ey_sq_sum, max_ey = 0.0, 0.0
     solve_times = []
@@ -269,13 +165,13 @@ def run(args):
             writer.writeheader()
             writer.writerow(dict(zip(fields, [
                 -1, 0, 0, 0, *xc[:3], 0, 0, *xc[3:], 0,
-                0, 0, 0, 0, -1, track_margin(track, 0.0, 0.0, half_width), 0,
+                0, 0, 0, 0, -1, plant.body_margin(), 0,
             ])))
             while args.steps == 0 or samples < args.steps:
                 loop_start = time.perf_counter()
-                parameters = stage_parameters(track, xf[0], args.N, args.dt, args.speed)
+                parameters = stage_parameters(track, horizon_s)
                 status, attempts, solve_ms = solve_with_recovery(
-                    solver, xf, parameters, args.N, args.dt, args.speed,
+                    solver, xf, parameters, args.N, args.dt,
                 )
                 if status == 0 and len(attempts) > 1:
                     recovered_solves += 1
@@ -306,20 +202,23 @@ def run(args):
                 u0 = np.asarray(solver.get(0, "u"), dtype=float).reshape(2)
                 if not np.all(np.isfinite(u0)):
                     raise ValueError("Nonfinite optimized control")
-                xc, acceleration = advance_plant(simulator, xc, xf[7], u0, sim_dt, substeps)
-                wrapped_s, ey, epsi = track.project(*xc[:3])
-                L = track.length
-                progress += ((wrapped_s - previous_s + L / 2) % L) - L / 2
-                previous_s = wrapped_s
-                xf = np.array([progress, ey, epsi, *xc[3:], acceleration])
+                plant.step(u0)
+                xc, xf = plant.cartesian, plant.frenet
+                progress, ey, epsi = (float(value) for value in xf[:3])
+                acceleration, L = float(xf[7]), track.length
+                predicted_s = np.array([solver.get(j, "x")[0] for j in range(args.N + 1)])
+                horizon_s = shifted_progress(predicted_s, xf[0])
                 if live is not None:
-                    live.record(xc, xf)
+                    live.record(xc, xf, planned_speed=float(solver.get(1, "x")[3]))
                 shift_warm_start(solver, args.N)
                 samples += 1
+                speeds.append(xc[3])
+                if lap_time is None and progress >= L:
+                    lap_time = samples * args.dt
                 ey_sq_sum += ey**2
                 max_ey = max(max_ey, abs(ey))
                 solve_times.append(solve_ms)
-                margins.append(track_margin(track, wrapped_s, ey, half_width))
+                margins.append(plant.body_margin())
                 slacks.append(slack)
                 writer.writerow(dict(zip(fields, [
                     samples - 1, samples * args.dt, max(0, int(progress // L)), progress,
@@ -328,14 +227,15 @@ def run(args):
                 ])))
                 if samples % 50 == 0:
                     handle.flush()
-                    print(f"step={samples} ey={ey:.3f}m solve={solve_ms:.2f}ms")
+                    print(f"step={samples} s={progress:.0f}m vx={xc[3]:.1f}m/s ey={ey:.3f}m "
+                          f"solve={solve_ms:.2f}ms")
                 if margins[-1] < 0 and not args.allow_off_track:
                     # Vehicle body crossed a track edge (ROADMAP D3).
                     stop_reason = "left_track"
                     print(f"Left the track at step {samples - 1}, s={progress:.1f} m: "
                           f"body {-margins[-1]:.2f} m beyond the edge")
                     break
-                if abs(ey) > args.max_error:
+                if args.max_error is not None and abs(ey) > args.max_error:
                     stop_reason = "excessive_tracking_error"
                     break
     except KeyboardInterrupt:
@@ -353,11 +253,16 @@ def run(args):
             live.close()
         summary = {
             "track": args.track, "horizon_N": args.N, "mpc_dt_s": args.dt,
-            "sim_dt_s": sim_dt, "reference_speed_mps": args.speed,
+            "sim_dt_s": sim_dt, "progress_weight": args.progress_weight,
+            "initial_speed_mps": args.v_init, "speed_limit_mps": constraints.speed_max,
+            "controller": args.controller, "leapc_retries": getattr(solver, "retries", None),
             "terminal_cost": args.terminal_cost, "track_scale": args.scale,
             "track_length_m": track.length, "samples": samples,
             "simulated_time_s": samples * args.dt,
             "completed_laps": max(0, int(progress // track.length)),
+            "lap_time_s": lap_time,
+            "mean_speed_mps": float(np.mean(speeds)) if samples else None,
+            "max_speed_mps": float(np.max(speeds)) if samples else None,
             "stop_reason": stop_reason, "solver_failures": failures,
             "recovered_solves": recovered_solves,
             "lateral_rmse_m": float(np.sqrt(ey_sq_sum / samples)) if samples else None,
@@ -385,7 +290,10 @@ def parse_args():
     parser.add_argument("--track", default="Silverstone")
     parser.add_argument("--N", type=int, default=38)
     parser.add_argument("--dt", type=float, default=0.08)
-    parser.add_argument("--speed", type=float, default=5.0)
+    parser.add_argument("--v-init", type=float, default=10.0,
+                        help="initial speed of the car and the first guess [m/s]; not a reference")
+    parser.add_argument("--progress-weight", type=float, default=1.0,
+                        help="stage-cost weight q_s on the progress reward -s_dot")
     parser.add_argument("--scale", type=float, default=10.0)
     parser.add_argument("--steps", type=int, default=1000,
                         help="simulation steps; 0 runs until Ctrl+C, then opens visualization")
@@ -400,17 +308,27 @@ def parse_args():
     parser.add_argument("--live-rate", type=float,
                         help="pace the live view to this multiple of real time (1 = real time); "
                              "default runs as fast as possible")
-    parser.add_argument("--max-error", type=float, default=8.0)
+    parser.add_argument("--max-error", type=float,
+                        help="optional stop when |ey| from the raceline exceeds this [m]; "
+                             "off by default, the track-edge stop applies")
     parser.add_argument("--track-margin", type=float, default=0.3,
                         help="safety margin between vehicle body and track edge in the MPC [m]")
     parser.add_argument("--allow-off-track", action="store_true",
                         help="keep running after the vehicle body crosses a track edge")
     parser.add_argument("--terminal-cost", choices=("quadratic", "zero"), default="quadratic")
+    parser.add_argument("--controller", choices=("acados", "leapc", "leapc-unshifted"), default="acados",
+                        help="acados = Phase 1 solver; leapc = Leap-C MPC, fixed theta, shifted warm "
+                             "start; leapc-unshifted = same with the warm start used in RL training")
     parser.add_argument("--output", help="explicit output directory; files inside are overwritten")
     parser.add_argument("--replay", help="visualize a saved run directory without running MPC")
     args = parser.parse_args()
-    if args.N < 1 or not np.all(np.isfinite([args.dt, args.speed, args.scale, args.max_error])) or min(args.dt, args.speed, args.scale, args.max_error) <= 0:
-        parser.error("N, dt, speed, scale and max-error must be finite and positive")
+    positive = [args.dt, args.v_init, args.scale] + ([args.max_error] if args.max_error is not None else [])
+    if args.N < 1 or not np.all(np.isfinite(positive)) or min(positive) <= 0:
+        parser.error("N, dt, v-init, scale and max-error must be finite and positive")
+    if not (np.isfinite(args.progress_weight) and args.progress_weight >= 0):
+        parser.error("progress-weight must be finite and nonnegative")
+    if args.controller != "acados" and args.terminal_cost != "quadratic":
+        parser.error("--terminal-cost zero is only available with --controller acados")
     if args.steps < 0 or args.plot_every < 1 or args.live_every < 1:
         parser.error("steps must be >= 0; prediction-every and live-every must be >= 1")
     if not (np.isfinite(args.track_margin) and args.track_margin >= 0):

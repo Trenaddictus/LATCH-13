@@ -1,8 +1,9 @@
 """Sanity-check a track: projection, raceline-relative edges, and plots.
 
 Checks the ROADMAP step 1 acceptance criteria: ey_min(s) < 0 < ey_max(s),
-asymmetric bounds in corners, and edges reconstructed from
-raceline + ey_min/max * normal coinciding with the edge polylines.
+asymmetric bounds in corners, and that the interpolated edges the MPC uses
+follow the edge polylines: never beyond them (within the tolerance), and
+coinciding with them except where narrowed at sharp edge corners.
 """
 import argparse
 from pathlib import Path
@@ -10,10 +11,11 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from latch13.tracks.f1tenth import load_track
+from latch13.tracks.f1tenth import _ray_distance, load_track
 
 ROOT = Path(__file__).resolve().parents[1]
 TRACK_ROOT = ROOT / "external" / "f1tenth_racetracks"
+TOLERANCE = 0.003  # how far the interpolated edges may pass the polylines, per unit of --scale
 
 
 def distance_to_polyline(points, polyline):
@@ -61,7 +63,19 @@ def main():
     right = track.points + track.ey_min[:, None] * normals
     error = max(distance_to_polyline(left, track.left).max(),
                 distance_to_polyline(right, track.right).max())
-    print(f"reconstructed edges: max distance to edge polylines {error:.2e} m")
+    print(f"reconstructed edges: max narrowing at edge corners {error:.2f} m")
+
+    # Between the vertices, at points other than those the loader samples.
+    fraction = (np.arange(13) + 0.5) / 13
+    s = (track.s[:, None] + fraction * track.segment_lengths[:, None]).ravel()
+    points, yaw, _ = track.pose(s)
+    normal = np.column_stack((-np.sin(yaw), np.cos(yaw)))
+    ey_min, ey_max = track.edges(s)
+    beyond = max((ey_max - _ray_distance(points, normal, track.left)).max(),
+                 (-ey_min - _ray_distance(points, -normal, track.right)).max())
+    tolerance = TOLERANCE * args.scale
+    print(f"interpolated edges: at most {beyond:.4f} m beyond the polylines (tolerance {tolerance:.3f} m) -> "
+          f"{'OK' if inside and beyond <= tolerance else 'FAIL'}")
 
     fig, (xy, offsets) = plt.subplots(1, 2, figsize=(15, 7), width_ratios=(1, 1.3))
     close = lambda points: np.vstack((points, points[:1])).T  # noqa: E731
@@ -90,7 +104,8 @@ def main():
         print(f"Saved {args.output}")
     else:
         plt.show()
+    return 0 if inside and beyond <= tolerance else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
