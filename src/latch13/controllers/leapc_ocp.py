@@ -10,10 +10,10 @@ this module changes only what Leap-C needs:
 * the terminal cost reads theta (``p_global``, differentiable). Curvature and
   track edges stay non-differentiable stage parameters ("track").
 
-Terminal cost, docs/PROBLEM_SPEC.md section 3, stage A:
+Terminal cost, docs/PROBLEM_SPEC.md section 3 (the supervisor's form), stage A:
 
-    V_f = xi' L L' xi + fixed * [vy, r, delta]^2
-    xi  = [ey, epsi, softplus(vx - v_threshold)]
+    V_f = xi' L L' xi = sum_i exp(log_weights_i) * xi_i^2
+    xi  = [ey, epsi, vx, vy, r, delta, a]   (the terminal state without s)
     L   = diag(exp(log_weights / 2))
 
 Stage B (full matrix) only has to fill the lower triangle of L.
@@ -60,32 +60,24 @@ class DiagonalTerminalTheta:
     """Initial values and RL bounds of theta.
 
     Keep defaults strictly inside the bounds: the SAC actor squashes with tanh,
-    so a default on a bound has almost no gradient and no exploration.
+    so a default on a bound has almost no gradient and no exploration. The
+    supervisor's lower bound of 0.01 is therefore 1e-4, below the 0.01 start
+    values of vx and a.
     """
 
-    weights: tuple = (40.0, 20.0, 0.01)  # ey, epsi, overspeed
-    weights_min: tuple = (1.0, 1.0, 1e-4)
-    weights_max: tuple = (1000.0, 1000.0, 100.0)
-    v_threshold: float = 25.0
-    v_threshold_min: float = 5.0
-    v_threshold_max: float = 30.0
-    softplus_beta: float = 2.0
+    # ey, epsi, vx, vy, r, delta, a: the default terminal cost of ocp.py
+    weights: tuple = tuple(getattr(QuadraticTerminalCost(), name) for name in (
+        "ey", "epsi", "vx", "vy", "yaw_rate", "steering_angle", "acceleration"))
+    weight_min: float = 1e-4
+    weight_max: float = 1000.0
 
     def defaults(self):
-        return OrderedDict(
-            log_weights=np.log(np.asarray(self.weights, dtype=float)),
-            v_threshold=np.array([self.v_threshold], dtype=float),
-        )
+        return OrderedDict(log_weights=np.log(np.asarray(self.weights, dtype=float)))
 
     def space(self):
-        low = OrderedDict(
-            log_weights=np.log(np.asarray(self.weights_min, dtype=float)),
-            v_threshold=np.array([self.v_threshold_min], dtype=float),
-        )
-        high = OrderedDict(
-            log_weights=np.log(np.asarray(self.weights_max, dtype=float)),
-            v_threshold=np.array([self.v_threshold_max], dtype=float),
-        )
+        size = len(self.weights)
+        low = OrderedDict(log_weights=np.full(size, np.log(self.weight_min)))
+        high = OrderedDict(log_weights=np.full(size, np.log(self.weight_max)))
         for name, value in self.defaults().items():
             if not np.all((low[name] < value) & (value < high[name])):
                 raise ValueError(f"Default {name} must lie strictly inside its bounds")
@@ -106,13 +98,12 @@ def _rk4(rhs, x, u, p, dt, substeps):
     return x
 
 
-def _terminal_cost(x, log_weights, v_threshold, beta, fixed):
-    overspeed = ca.log1p(ca.exp(beta * (x[3] - v_threshold))) / beta
-    xi = ca.vertcat(x[1], x[2], overspeed)
+def _terminal_cost(x, log_weights):
+    # The vy, r and delta weights must stay well above zero for SQP convergence
+    # (STEP3_SOLVER_ISSUES.md); they start at 10 as in Phase 1.
+    xi = x[1:]
     L = ca.diag(ca.exp(log_weights / 2))
-    # The fixed lateral terms are needed for SQP convergence (STEP3_SOLVER_ISSUES.md).
-    return (ca.sumsqr(L.T @ xi) + fixed.vy * x[4]**2
-            + fixed.yaw_rate * x[5]**2 + fixed.steering_angle * x[6]**2)
+    return ca.sumsqr(L.T @ xi)
 
 
 def build_leapc_ocp(
@@ -152,10 +143,7 @@ def build_leapc_ocp(
     model.p = track
     model.disc_dyn_expr = _rk4(lambda *args: expressions(*args)[0], x, u, track, dt, substeps)
     model.cost_expr_ext_cost = stage_cost
-    model.cost_expr_ext_cost_e = _terminal_cost(
-        x, symbols["log_weights"], symbols["v_threshold"], theta.softplus_beta,
-        QuadraticTerminalCost(),
-    )
+    model.cost_expr_ext_cost_e = _terminal_cost(x, symbols["log_weights"])
     model.con_h_expr = h
     model.con_h_expr_e = h
     ocp.model = model
@@ -196,8 +184,8 @@ def build_diff_mpc(
 ):
     """Compile the batched differentiable MPC; return (mpc, param_space, defaults).
 
-    Call it with ``params`` holding "log_weights" (B, 3) and "v_threshold" (B, 1)
-    tensors, plus "track" (B, N+1, 3) = [curvature, ey_min, ey_max]. Use float64
+    Call it with ``params`` holding "log_weights" (B, 7) and "track"
+    (B, N+1, 3) = [curvature, ey_min, ey_max]. Use float64
     states: progress s reaches kilometres. Give each configuration its own
     export directory, so compiled code can be reused.
 

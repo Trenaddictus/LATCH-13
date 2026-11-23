@@ -58,9 +58,13 @@ class StageCostWeights:
 
 @dataclass(frozen=True)
 class QuadraticTerminalCost:
-    """Baseline terminal strategy, replaceable independently of stage costs."""
-    
-    #Terminal cost double the stage cost; no speed term (ROADMAP step 3).
+    """Baseline terminal strategy, replaceable independently of stage costs.
+
+    Equals the initial P of the learned terminal cost (docs/PROBLEM_SPEC.md
+    section 3), which reads its initial weights from here.
+    """
+
+    #Terminal cost double the stage cost (ROADMAP step 3).
     ey: float = 40.0
     epsi: float = 20.0
     # Lateral states at the end of the horizon are otherwise almost free: with
@@ -69,11 +73,16 @@ class QuadraticTerminalCost:
     vy: float = 10.0
     yaw_rate: float = 10.0
     steering_angle: float = 10.0
+    # Small pull on the terminal speed and acceleration (initial P, 2026-11-23). The speed
+    # weight sets the cruise speed: 0.01 gives about 20.5 m/s (docs/PROBLEM_SPEC.md section 3).
+    vx: float = 0.01
+    acceleration: float = 0.01
 
     def __call__(self, x, p):
         _validate_weights(self)
-        return (self.ey * x[1]**2 + self.epsi * x[2]**2
-                + self.vy * x[4]**2 + self.yaw_rate * x[5]**2 + self.steering_angle * x[6]**2)
+        return (self.ey * x[1]**2 + self.epsi * x[2]**2 + self.vx * x[3]**2
+                + self.vy * x[4]**2 + self.yaw_rate * x[5]**2 + self.steering_angle * x[6]**2
+                + self.acceleration * x[7]**2)
 
 
 def zero_terminal_cost(x, p):

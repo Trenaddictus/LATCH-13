@@ -24,16 +24,14 @@ from latch13.controllers.ocp import QuadraticTerminalCost
 
 
 def phase1_theta():
-    """Theta that reproduces the Phase 1 terminal cost (overspeed term off).
+    """Theta that reproduces the default terminal cost of ``ocp.py``.
 
-    These values deliberately lie on or outside the RL bounds: log-weights
-    cannot express a zero weight, so the speed weight is 1e-12.
+    Since 2026-11-23 this is also the initial theta of RL.
     """
     cost = QuadraticTerminalCost()
-    return {
-        "log_weights": np.log([cost.ey, cost.epsi, 1e-12]),
-        "v_threshold": np.array([30.0]),
-    }
+    return {"log_weights": np.log([
+        cost.ey, cost.epsi, cost.vx, cost.vy, cost.yaw_rate, cost.steering_angle, cost.acceleration,
+    ])}
 
 
 class FixedThetaSolver:

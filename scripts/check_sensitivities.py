@@ -67,13 +67,12 @@ def stage_parameters(track, states, N, dt):
 
 def sample_thetas(count, rng):
     spec = DiagonalTerminalTheta()
-    space = spec.space()
-    flat = lambda values: np.concatenate([values["log_weights"], values["v_threshold"]])  # noqa: E731
-    low = flat({name: box.low for name, box in space.spaces.items()})
-    high = flat({name: box.high for name, box in space.spaces.items()})
-    thetas = rng.uniform(low, high, (count, 4))
-    thetas[0::4] = flat(spec.defaults())
-    thetas[1::4] = np.r_[np.log([40.0, 20.0, 1.0]), 15.0]
+    box = spec.space()["log_weights"]
+    thetas = rng.uniform(box.low, box.high, (count, box.shape[0]))
+    thetas[0::4] = spec.defaults()["log_weights"]
+    braking = np.array(spec.weights)
+    braking[2] = 1.0  # a strong pull on the terminal speed
+    thetas[1::4] = np.log(braking)
     return thetas
 
 
@@ -81,12 +80,12 @@ def solve(mpc, states, track_p, theta, ctx=None):
     theta = torch.as_tensor(theta, dtype=torch.float64)
     return mpc(
         torch.as_tensor(states, dtype=torch.float64), ctx=ctx,
-        params={"log_weights": theta[:, :3], "v_threshold": theta[:, 3:], "track": track_p},
+        params={"log_weights": theta, "track": track_p},
     )
 
 
 def autograd_gradients(mpc, states, track_p, theta):
-    """Return (ctx, d[u0, V]/dtheta) with shape (batch, 3, 4), and the state plan."""
+    """Return (ctx, d[u0, V]/dtheta) with shape (batch, 3, theta size), and the state plan."""
     variable = torch.tensor(theta, dtype=torch.float64, requires_grad=True)
     ctx, u0, x, _, value = solve(mpc, states, track_p, variable)
     outputs = torch.cat((u0, value), dim=1)
@@ -97,9 +96,10 @@ def autograd_gradients(mpc, states, track_p, theta):
 
 def central_differences(mpc, states, track_p, theta, ctx, plan, step):
     """Central differences; NaN where a solve fails or leaves the local optimum."""
-    result = np.empty((len(states), 3, 4))
-    for i in range(4):
-        delta = np.eye(4)[i] * step
+    size = theta.shape[1]
+    result = np.empty((len(states), 3, size))
+    for i in range(size):
+        delta = np.eye(size)[i] * step
         plus, up, xp, _, vp = solve(mpc, states, track_p, theta + delta, ctx)
         minus, um, xm, _, vm = solve(mpc, states, track_p, theta - delta, ctx)
         # Smooth branch: the midpoint of both plans is the unperturbed plan.
