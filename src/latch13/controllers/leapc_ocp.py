@@ -63,21 +63,26 @@ class DiagonalTerminalTheta:
     so a default on a bound has almost no gradient and no exploration. The
     supervisor's lower bound of 0.01 is therefore 1e-4, below the 0.01 start
     values of vx and a.
+
+    The vx weight has its own, narrow bounds (2026-11-24, docs/PROBLEM_SPEC.md
+    section 3): it acts as a cruise-speed setting. Below about 0.003 it has no
+    effect; from about 0.1 the car stops, which can only end an episode.
     """
 
     # ey, epsi, vx, vy, r, delta, a: the default terminal cost of ocp.py
     weights: tuple = tuple(getattr(QuadraticTerminalCost(), name) for name in (
         "ey", "epsi", "vx", "vy", "yaw_rate", "steering_angle", "acceleration"))
-    weight_min: float = 1e-4
-    weight_max: float = 1000.0
+    weights_min: tuple = (1e-4, 1e-4, 1e-3, 1e-4, 1e-4, 1e-4, 1e-4)
+    weights_max: tuple = (1000.0, 1000.0, 0.05, 1000.0, 1000.0, 1000.0, 1000.0)
 
     def defaults(self):
         return OrderedDict(log_weights=np.log(np.asarray(self.weights, dtype=float)))
 
     def space(self):
-        size = len(self.weights)
-        low = OrderedDict(log_weights=np.full(size, np.log(self.weight_min)))
-        high = OrderedDict(log_weights=np.full(size, np.log(self.weight_max)))
+        if not len(self.weights) == len(self.weights_min) == len(self.weights_max):
+            raise ValueError("weights, weights_min and weights_max must have the same length")
+        low = OrderedDict(log_weights=np.log(np.asarray(self.weights_min, dtype=float)))
+        high = OrderedDict(log_weights=np.log(np.asarray(self.weights_max, dtype=float)))
         for name, value in self.defaults().items():
             if not np.all((low[name] < value) & (value < high[name])):
                 raise ValueError(f"Default {name} must lie strictly inside its bounds")

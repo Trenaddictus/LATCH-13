@@ -67,8 +67,32 @@ def max_slack(solver, N):
     return float(max(np.max(v) if v.size else 0.0 for v in values))
 
 
-def run(args):
+def learned_constant_theta(args, track, stage_weights):
+    """theta of a --constant-theta training run, checked against this run's settings."""
     from dataclasses import asdict
+
+    from latch13.learning.policy import best_checkpoint, constant_theta, run_config
+    from latch13.simulation.env import RacingEnv
+
+    run_dir = Path(args.learned).resolve()
+    config = run_config(run_dir)
+    if config["args"]["N"] != args.N:
+        raise SystemExit(f"{run_dir.name} was trained for N = {config['args']['N']}, not N = {args.N}")
+    if config["planner"]["stage_weights"] != asdict(stage_weights):
+        raise SystemExit(f"{run_dir.name} was trained with other stage weights; its theta fits only those")
+    step, score = (args.learned_step, None) if args.learned_step else best_checkpoint(run_dir)
+    env = RacingEnv(TUM_CONFIG, track, mode="full")  # only for the observation and action spaces
+    try:
+        theta = constant_theta(run_dir, step, env.observation_space, env.action_space)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    return theta, {"run": str(run_dir), "step": step, "validation_score": score,
+                   "log_weights": theta["log_weights"].tolist(),
+                   "weights": np.exp(theta["log_weights"]).tolist()}
+
+
+def run(args):
+    from dataclasses import asdict, replace
     from datetime import datetime
 
     # TUM-CONTROL uses top-level imports such as Prediction_Models and
@@ -81,7 +105,8 @@ def run(args):
         sys.path.insert(0, str(tum_root))
 
     from latch13.controllers.ocp import (
-        ConstraintOptions, SolverOptions, StageCostWeights, build_mpc, zero_terminal_cost,
+        ConstraintOptions, SolverOptions, build_mpc, default_stage_weights, load_stage_weights,
+        weights_tag, zero_terminal_cost,
     )
     from latch13.simulation.closed_loop import (
         constant_speed_progress, initialize_solver, prediction_snapshot, shift_warm_start,
@@ -99,7 +124,13 @@ def run(args):
     # Save geometry so replay needs neither track CSVs nor the solver.
     track.to_npz(output / "track.npz")
     constraints = ConstraintOptions(track_margin=args.track_margin)
-    stage_weights = StageCostWeights(progress=args.progress_weight)
+    if args.stage_weights:
+        stage_weights = load_stage_weights(args.stage_weights)
+        if stage_weights.progress != args.progress_weight:
+            raise SystemExit(f"--stage-weights has progress weight {stage_weights.progress}; "
+                             f"--progress-weight {args.progress_weight} contradicts it")
+    else:
+        stage_weights = replace(default_stage_weights(args.N), progress=args.progress_weight)
     (output / "config.json").write_text(json.dumps({
         **vars(args), "solver_options": asdict(SolverOptions()),
         "stage_weights": asdict(stage_weights),
@@ -117,12 +148,18 @@ def run(args):
         )
     else:
         from latch13.controllers.leapc_fixed import build_fixed_theta_solver
+        theta, learned = None, None
+        if args.learned:
+            theta, learned = learned_constant_theta(args, track, stage_weights)
+            print(f"Learned terminal cost: {learned['run']} at step {learned['step']}: weights "
+                  + ", ".join(f"{w:.4g}" for w in learned["weights"]))
+            (output / "learned_theta.json").write_text(json.dumps(learned, indent=2), encoding="utf-8")
         # Stable directory, so compiled code is reused; acados rebuilds it if the OCP changes.
         generated = (ROOT / "results" / "generated" / "leapc" / "closed_loop" /
-                     f"N{args.N}_dt{args.dt}_q{args.progress_weight}_m{args.track_margin}")
+                     f"N{args.N}_dt{args.dt}_m{args.track_margin}_w{weights_tag(stage_weights)}")
         solver = build_fixed_theta_solver(
             TUM_CONFIG, generated, N=args.N, dt=args.dt, shift=args.controller == "leapc",
-            stage_weights=stage_weights, constraints=constraints,
+            stage_weights=stage_weights, constraints=constraints, theta=theta,
         )
     initialize_solver(solver, xf, args.N, args.dt)
     simulator, sim_dt = plant.simulator, plant.sim_dt
@@ -256,6 +293,7 @@ def run(args):
             "sim_dt_s": sim_dt, "progress_weight": args.progress_weight,
             "initial_speed_mps": args.v_init, "speed_limit_mps": constraints.speed_max,
             "controller": args.controller, "leapc_retries": getattr(solver, "retries", None),
+            "learned_run": args.learned, "learned_step": learned["step"] if args.learned else None,
             "terminal_cost": args.terminal_cost, "track_scale": args.scale,
             "track_length_m": track.length, "samples": samples,
             "simulated_time_s": samples * args.dt,
@@ -295,6 +333,10 @@ def parse_args():
     parser.add_argument("--progress-weight", type=float, default=1.0,
                         help="stage-cost weight q_s on the progress reward -s_dot")
     parser.add_argument("--scale", type=float, default=10.0)
+    parser.add_argument("--stage-weights", metavar="FILE",
+                        help="stage weights from a JSON file, e.g. results/optuna/<study>/"
+                             "best_stage_weights.json, or 'hand-picked'; default: the tuned weights "
+                             "of this horizon (N = 10, 38), otherwise the hand-picked ones")
     parser.add_argument("--steps", type=int, default=1000,
                         help="simulation steps; 0 runs until Ctrl+C, then opens visualization")
     parser.add_argument("--plot-every", "--prediction-every", dest="plot_every", type=int, default=5,
@@ -319,6 +361,11 @@ def parse_args():
     parser.add_argument("--controller", choices=("acados", "leapc", "leapc-unshifted"), default="acados",
                         help="acados = Phase 1 solver; leapc = Leap-C MPC, fixed theta, shifted warm "
                              "start; leapc-unshifted = same with the warm start used in RL training")
+    parser.add_argument("--learned", metavar="RUN",
+                        help="terminal cost learned by a --constant-theta training run (results/rl/...); "
+                             "use with --controller leapc-unshifted")
+    parser.add_argument("--learned-step", type=int,
+                        help="checkpoint step of --learned; default: the best validation score")
     parser.add_argument("--output", help="explicit output directory; files inside are overwritten")
     parser.add_argument("--replay", help="visualize a saved run directory without running MPC")
     args = parser.parse_args()
@@ -327,6 +374,10 @@ def parse_args():
         parser.error("N, dt, v-init, scale and max-error must be finite and positive")
     if not (np.isfinite(args.progress_weight) and args.progress_weight >= 0):
         parser.error("progress-weight must be finite and nonnegative")
+    if args.learned and args.controller == "acados":
+        parser.error("--learned needs --controller leapc-unshifted (the warm start of training) or leapc")
+    if args.learned_step is not None and not args.learned:
+        parser.error("--learned-step needs --learned")
     if args.controller != "acados" and args.terminal_cost != "quadratic":
         parser.error("--terminal-cost zero is only available with --controller acados")
     if args.steps < 0 or args.plot_every < 1 or args.live_every < 1:

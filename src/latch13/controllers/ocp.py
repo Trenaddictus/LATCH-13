@@ -9,7 +9,9 @@ Inspired by TUM's Nominal_NMPC/NMPC_class.py and its acados settings module:
 model construction, costs, constraints, and solver creation are separate.
 """
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Protocol
 
@@ -54,6 +56,53 @@ class StageCostWeights:
     #R matrix entries
     jerk: float = 0.01
     steering_rate: float = 0.05
+
+
+# Tuned with Optuna, one set per horizon (scripts/tune_stage_weights.py; ROADMAP "Stage-weight
+# tuning"). FROZEN on 2026-11-24 for RL training: changing them invalidates every trained theta
+# (ROADMAP Phase 4). The hand-picked weights are the StageCostWeights defaults above
+# ("--stage-weights hand-picked").
+TUNED_STAGE_WEIGHTS = {
+    38: StageCostWeights(
+        progress=1.0, ey=16.119283547937755, epsi=24.273681370192005, vy=0.1448771083975021,
+        yaw_rate=0.23230960919035312, acceleration=0.0790032702661071, jerk=0.005197761196121792,
+        steering_rate=0.3368912295147675,
+    ),
+    # N = 10: trial 84 of the first study (trial 2 of the robust study). Not the best score: the
+    # best-scoring weights of both studies failed outside the laps they were tuned on, while these
+    # finished every check (ROADMAP "Stage-weight tuning").
+    10: StageCostWeights(
+        progress=1.0, ey=150.06957542133145, epsi=89.58353978567126, vy=0.0020449173600114146,
+        yaw_rate=0.5174571029260523, acceleration=0.023017294097330474, jerk=0.0048361170310622864,
+        steering_rate=0.3774461756518242,
+    ),
+}
+
+
+def default_stage_weights(N):
+    """The tuned weights for N = 10 and N = 38, the hand-picked ones for other horizons."""
+    return TUNED_STAGE_WEIGHTS.get(int(N), StageCostWeights())
+
+
+def load_stage_weights(path):
+    """Stage weights from a JSON file with a "stage_weights" object, such as the
+    best_stage_weights.json written by scripts/tune_stage_weights.py.
+    ``"hand-picked"`` gives the hand-picked weights of Phase 1."""
+    if str(path) == "hand-picked":
+        return StageCostWeights()
+    values = json.loads(Path(path).read_text(encoding="utf-8"))["stage_weights"]
+    expected = {field.name for field in fields(StageCostWeights)}
+    if set(values) != expected:
+        raise ValueError(f"{path}: expected stage weights {sorted(expected)}, got {sorted(values)}")
+    weights = StageCostWeights(**{name: float(value) for name, value in values.items()})
+    _validate_weights(weights)
+    return weights
+
+
+def weights_tag(weights):
+    """Short fingerprint of a weights dataclass, e.g. for a compiled-code directory name."""
+    text = json.dumps({field.name: getattr(weights, field.name) for field in fields(weights)}, sort_keys=True)
+    return hashlib.sha1(text.encode()).hexdigest()[:8]
 
 
 @dataclass(frozen=True)
@@ -256,6 +305,7 @@ def build_ocp(
 ):
     """Construct an inspectable OCP without generating or compiling code.
 
+    ``stage_weights=None`` selects ``default_stage_weights(N)``.
     ``terminal_cost=None`` selects QuadraticTerminalCost; explicitly pass
     zero_terminal_cost to disable it, or any TerminalCost callable to replace it.
     Keep stage weights/dt identical when comparing different horizon lengths.
@@ -280,7 +330,7 @@ def build_ocp(
     if (ocp.model.x.numel(), ocp.model.u.numel(), ocp.model.p.numel()) != (8, 2, 3):
         raise ValueError("Expected eight states, two controls, and [curvature, ey_min, ey_max]")
     _configure_costs(
-        ocp, stage_weights if stage_weights is not None else StageCostWeights(),
+        ocp, stage_weights if stage_weights is not None else default_stage_weights(N),
         terminal_cost if terminal_cost is not None else QuadraticTerminalCost(),
     )
     _configure_constraints(ocp, x0, constraints if constraints is not None else ConstraintOptions())

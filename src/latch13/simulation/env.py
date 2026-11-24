@@ -20,12 +20,14 @@ resets the validation environment. In val and test, finishing a section adds
 the time left before the time limit as progress at full speed, so that the
 summed score sees time. The training reward has no such bonus.
 
-Reward weights, penalty, time limit, split and start distribution are
-PLACEHOLDERS until the group decides (docs/PROBLEM_SPEC.md section 10).
+Reward weights, failure penalty (100), time limit, split and validation score
+were decided on 2026-11-24 (docs/PROBLEM_SPEC.md section 10). The start
+distribution is still a proposal.
 
 As with ``ocp.py``, external/TUM-CONTROL must be on sys.path.
 """
 
+import csv
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,6 +39,10 @@ from latch13.controllers.ocp import ConstraintOptions
 from latch13.simulation.plant import ClosedLoopPlant, PlantStateError
 
 MODES = ("train", "val", "test", "full")
+# Every way an episode ends; info["task"] has one 0/1 flag per entry ("end_<reason>"), which mpc-sac
+# averages into the share of episodes that ended that way.
+TERMINATIONS = ("left_track", "spun", "low_speed", "state_out_of_bounds", "non_finite_state", "mpc_failure")
+TRUNCATIONS = ("section_end", "time_limit")
 # ey, epsi, vx, vy, r, delta, a. Wide enough for every state that may continue:
 # a state outside ends the episode, so clipping never alters the MPC's x0.
 STATE_LOW = np.array([-22.0, -np.pi / 2, 0.0, -10.0, -3.0, -0.7, -4.0])
@@ -46,10 +52,14 @@ STATE_HIGH = np.array([22.0, np.pi / 2, 30.0, 10.0, 3.0, 0.7, 3.0])
 @dataclass(frozen=True)
 class RewardOptions:
     progress: float = 1.0
-    tracking: float = 0.1
+    # 1.0 since 2026-11-24 (was 0.1): with 0.1, 3 m/s more speed outweighed 1 m of tracking error
+    # about 15:1 and the learned controllers drove up to 10 m wide (ROADMAP Step 13).
+    tracking: float = 1.0
     heading: float = 100.0  # 0.1 rad counts like 1 m
     lateral_excess: float = 1.0
-    failure_penalty: float = 10.0
+    # 100 since 2026-11-24 (was 10): continuing is worth about 85 in discounted reward, so 10 added
+    # little to a crash, and the pilot traded crashes for speed (ROADMAP Step 12).
+    failure_penalty: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -80,12 +90,16 @@ class Section:
 def silverstone_sections():
     """Split of docs/PROBLEM_SPEC.md section 7, for Silverstone scaled x10.
 
-    Validation is corners 12+13, test corners 5+6. Training ends far enough
-    before both that its 200 m preview never reaches a held-out corner.
+    Test is corners 5+6 (held out). Validation is corners 12+13 (held out from
+    training) and, since 2026-11-24, also the hairpin (corners 3+4, s = 450-1000 m),
+    so that checkpoint selection sees the hardest corner. The hairpin is also
+    in the training split; only the test section is strictly held out.
+    Training ends far enough before the held-out corners that its 200 m
+    preview never reaches them.
     """
     return {
         "train": (Section(1850.0, 3930.0, 1980.0), Section(4430.0, 1095.0, 1030.0)),
-        "val": (Section(3930.0, 4430.0, 60.0),),
+        "val": (Section(3930.0, 4430.0, 60.0), Section(450.0, 1000.0, 60.0)),
         "test": (Section(1300.0, 1850.0, 120.0),),
     }
 
@@ -124,7 +138,10 @@ class RacingEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, config_dir, track, mode="train", dt=0.08, options=None, constraints=None):
+    def __init__(self, config_dir, track, mode="train", dt=0.08, options=None, constraints=None,
+                 episode_log=None):
+        """``episode_log``: optional CSV file that gets one row per finished episode (where it
+        started and ended, how it ended, its length and return)."""
         if mode not in MODES:
             raise ValueError(f"Unknown mode {mode!r}, expected one of {MODES}")
         self.track, self.mode, self.dt = track, mode, float(dt)
@@ -145,6 +162,8 @@ class RacingEnv(gym.Env):
         self.render_mode = None
         self._steps, self._section_left = 0, np.inf
         self._observation = None
+        self._episode_log = Path(episode_log) if episode_log is not None else None
+        self._start, self._return = None, 0.0
 
     def _validated_sections(self):
         length = self.track.length
@@ -223,6 +242,7 @@ class RacingEnv(gym.Env):
         else:
             section = self._sample_start()
         self._steps, self._section_left = 0, np.inf
+        self._start, self._return = self.plant.frenet.copy(), 0.0
         if self.mode != "full":
             self._section_left = (section.end - self.plant.wrapped_s) % self.track.length
         self._observation = self._observe()
@@ -300,5 +320,25 @@ class RacingEnv(gym.Env):
         info = self._state_info()
         info.update(termination=reason, lateral_excess=excess)
         if terminated or truncated:
-            info["task"] = {"violation": reason == "left_track", "success": truncated}
+            info["task"] = {"violation": reason == "left_track", "success": truncated,
+                            **{f"end_{name}": float(reason == name) for name in TERMINATIONS + TRUNCATIONS}}
+        self._return += reward
+        if (terminated or truncated) and self._episode_log is not None:
+            self._log_episode(reason)
         return self._observation.copy(), reward, terminated, truncated, info
+
+    def _log_episode(self, reason):
+        state, length = self.plant.frenet, self.track.length
+        row = {
+            "termination": reason, "steps": self._steps, "return": round(self._return, 4),
+            "start_s_m": round(self._start[0] % length, 2), "start_vx_mps": round(self._start[3], 3),
+            "end_s_m": round(state[0] % length, 2), "end_vx_mps": round(state[3], 3),
+            "end_ey_m": round(state[1], 3), "distance_m": round(state[0] - self._start[0], 2),
+        }
+        new = not self._episode_log.exists()
+        self._episode_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._episode_log, "a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
+            if new:
+                writer.writeheader()
+            writer.writerow(row)

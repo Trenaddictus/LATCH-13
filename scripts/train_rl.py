@@ -9,8 +9,8 @@ split; the best checkpoint is kept.
     python scripts/train_rl.py --constant-theta          # one theta for the whole track (Step 12)
 
 An existing --output directory continues from its last checkpoint. Run with the
-venv activated. Reward, split and the other env settings are placeholders until
-the group decides them (docs/PROBLEM_SPEC.md section 10).
+venv activated. The env settings (reward, penalty, split) were decided on
+2026-11-24 (docs/PROBLEM_SPEC.md section 10).
 """
 
 import argparse
@@ -28,7 +28,9 @@ sys.path.insert(0, str(ROOT / "external" / "TUM-CONTROL"))
 from leapc_lab.planner import ControllerFromPlanner  # noqa: E402
 from mpc_sac.rl.sac_zop import SacZopTrainer, SacZopTrainerConfig  # noqa: E402
 
+from latch13.controllers.ocp import default_stage_weights, load_stage_weights, weights_tag  # noqa: E402
 from latch13.controllers.planner import RacingPlanner, RacingPlannerConfig  # noqa: E402
+from latch13.learning.policy import actor_config  # noqa: E402
 from latch13.simulation.env import EnvOptions, RacingEnv  # noqa: E402
 from latch13.tracks.f1tenth import load_track  # noqa: E402
 
@@ -70,12 +72,8 @@ def trainer_config(args):
     cfg.log.wandb_logger = False
 
     cfg.critic_mlp.hidden_dims = (256, 256, 256)
-    cfg.actor.noise = "param"
-    cfg.actor.extractor_name = "scaling"
-    cfg.actor.distribution_name = "squashed_gaussian"
-    cfg.actor.residual = True  # start at the initial theta, not the middle of its bounds
-    # No hidden layers: the actor is a single learned theta, whatever the observation.
-    cfg.actor.mlp.hidden_dims = None if args.constant_theta else (256, 256, 256)
+    # Defined in latch13.learning.policy, so checkpoints can be rebuilt by the other scripts.
+    cfg.actor = actor_config(args.constant_theta)
     return cfg
 
 
@@ -119,6 +117,9 @@ def main():
     parser.add_argument("--log-interval", type=int, default=1000, help="log every this many steps")
     parser.add_argument("--dtype", choices=("float64", "float32"), default="float64",
                         help="networks and replay buffer; the MPC always solves in float64")
+    parser.add_argument("--stage-weights", metavar="FILE",
+                        help="stage weights from a JSON file (scripts/tune_stage_weights.py), or "
+                             "'hand-picked'; default: the tuned weights of this horizon")
     parser.add_argument("--track", default="Silverstone")
     parser.add_argument("--scale", type=float, default=10.0)
     parser.add_argument("--output", help="run directory; an existing one is continued")
@@ -134,12 +135,18 @@ def main():
 
     track = load_track(TRACK_ROOT, args.track, args.scale)
     env_options = EnvOptions()
-    train_env = RacingEnv(TUM_CONFIG, track, mode="train", options=env_options)
-    val_env = RacingEnv(TUM_CONFIG, track, mode="val", options=env_options)
-    planner_cfg = RacingPlannerConfig(N=args.N, dt=train_env.dt, near_vertices=env_options.near_vertices)
+    # One row per episode: where it started and ended, how it ended.
+    train_env = RacingEnv(TUM_CONFIG, track, mode="train", options=env_options,
+                          episode_log=output / "episodes_train.csv")
+    val_env = RacingEnv(TUM_CONFIG, track, mode="val", options=env_options,
+                        episode_log=output / "episodes_val.csv")
+    stage_weights = (load_stage_weights(args.stage_weights) if args.stage_weights
+                     else default_stage_weights(args.N))
+    planner_cfg = RacingPlannerConfig(N=args.N, dt=train_env.dt, near_vertices=env_options.near_vertices,
+                                      stage_weights=stage_weights)
     # One compiled solver per horizon, reused across runs; acados rebuilds it when the OCP changes.
-    planner = RacingPlanner(TUM_CONFIG, ROOT / "results" / "generated" / "leapc" / "planner" / f"N{args.N}",
-                            planner_cfg)
+    code = f"N{args.N}_w{weights_tag(stage_weights)}"
+    planner = RacingPlanner(TUM_CONFIG, ROOT / "results" / "generated" / "leapc" / "planner" / code, planner_cfg)
     cfg = trainer_config(args)
 
     dtype = getattr(torch, args.dtype)

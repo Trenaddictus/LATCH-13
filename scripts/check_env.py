@@ -140,10 +140,14 @@ def check_exit(track, params, count, rng):
 
 
 def check_splits(track, count):
+    sections = EnvOptions().sections
+    # Starts must stay out of what is held out from them. The validation hairpin overlaps the
+    # training split on purpose; the test section is held out from both.
+    forbidden = {"train": sections["test"] + sections["val"][:1], "val": sections["test"],
+                 "test": sections["train"] + sections["val"]}
     for mode in ("train", "val", "test"):
         env = RacingEnv(TUM_CONFIG, track, mode=mode)
-        others = [section for name, sections in env.options.sections.items() if name != mode
-                  for section in sections]
+        others = forbidden[mode]
         env.reset(seed=0)
         bad = 0
         for _ in range(count):
@@ -187,7 +191,9 @@ def check_endings(track):
         env = RacingEnv(TUM_CONFIG, track, mode=mode, options=EnvOptions(**options))
         env.reset(seed=0, options={"state": state})
         observation, reward, terminated, truncated, info = env.step(action)
-        finite = np.isfinite(reward) and env.observation_space.contains(observation)
+        flags = {key: value for key, value in info["task"].items() if key.startswith("end_")}
+        flagged = flags.get(f"end_{info['termination']}") == 1 and sum(flags.values()) == 1
+        finite = np.isfinite(reward) and env.observation_space.contains(observation) and flagged
         return info["termination"], terminated, truncated, finite
 
     edge = float(track.edges(2200)[1])
@@ -222,7 +228,11 @@ def check_mpc_sac(track):
     check("float32 replay buffer", buffer.sample(1)[0].shape == (1, *env.observation_space.shape))
 
     validation, visited = RacingEnv(TUM_CONFIG, track, mode="val"), []
-    section = validation.options.sections["val"][0]
+    sections = validation.options.sections["val"]
+
+    def inside(s):
+        return any((s - section.start + 5) % track.length <= (section.end - section.start + 5) % track.length
+                   for section in sections)
 
     def policy(observation):
         visited.append(validation.plant.wrapped_s)
@@ -230,8 +240,8 @@ def check_mpc_sac(track):
 
     episodes = list(episode_rollout(policy, wrap_env(validation), episodes=5, rng=3))
     check("mpc-sac validation stays in its split",
-          len(episodes) == 5 and all(section.start - 5 <= s <= section.end for s in visited),
-          f"s in [{min(visited):.0f}, {max(visited):.0f}]")
+          len(episodes) == 5 and all(inside(s) for s in visited),
+          f"{len(visited)} steps, all inside the validation sections: {all(inside(s) for s in visited)}")
 
 
 def main():
